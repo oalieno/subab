@@ -7,5 +7,5 @@ A small script that can translate `.srt` subtitles using **Modern Large Language
 Paste the below line into your Bazarr custom post-processing section.
 
 ```bash
-apk info py3-httpx >/dev/null 2>&1 || apk add py3-httpx && python /config/srtgpt.py "{{subtitles}}"
+python /config/srtgpt.py --api-base https://your.openai.api "{{subtitles}}"
 ```
