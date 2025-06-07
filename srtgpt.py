@@ -1,3 +1,4 @@
+import re
 import argparse
 import asyncio
 import json
@@ -54,7 +55,7 @@ class TranslationResult(NamedTuple):
 
 
 class TranAPI:
-    def __init__(self, api_base: str, model: str, max_retries: int = 3):
+    def __init__(self, api_base: str, model: str = "gemini-2.5-flash", max_retries: int = 3):
         self.api_endpoint = f"{api_base}/v1/chat/completions"
         self.model = model
         self.max_retries = max_retries
@@ -70,7 +71,7 @@ class TranAPI:
 4. **Subtitle-Friendly**: Keep translations concise, adhering to typical subtitle length limits. Ensure readability and clarity.  
 5. **Strict Output Format**: Provide the output **ONLY** as a JSON array of strings without any additional comments, explanations, or formatting outside the JSON array. MUST be valid JSON that can be parsed as List[str].
 
-**Examples of Correct and Incorrect Formatting:**
+### Examples of Correct and Incorrect Formatting:
 
 **Input Lines:**
 ["when I barely sell enough milkshakes", "to justify my single spindle? Right?"]
@@ -81,10 +82,19 @@ class TranAPI:
 **Correct (DO THIS):**
 ["當我目前的奶昔銷量甚至連", "單軸攪拌機的需求都撐不起來呢？對吧？"]
 
-**Your Task:**
+**Input Lines:**
+["- Fuck off. - I’m gonna."]
+
+**Incorrect (DO NOT DO THIS):**
+["- 滾開。", "- 我會的。"]
+
+**Correct (DO THIS):**
+["- 滾開。- 我會的。"]
+
+### Your Task:
 Translate the input array below and return only a JSON array of the corresponding Traditional Chinese translations.
 
-**Input Array:**  
+**Input Lines:**
 {json.dumps(texts, ensure_ascii=False)}
 """
 
@@ -115,10 +125,13 @@ Translate the input array below and return only a JSON array of the correspondin
     async def translate(self, texts: List[str]) -> List[str]:
         for _ in range(2):
             try:
-                translated_text = await self.llm(self.create_prompt(texts))
+                prompt = self.create_prompt(texts)
+                translated_text = await self.llm(prompt)
 
                 start, end = translated_text.find("["), translated_text.rfind("]")
                 if start == -1 or end == -1:
+                    logger.debug(f"prompt: {prompt}")
+                    logger.debug(f"response: {translated_text}")
                     raise TranslationError("No JSON array found in response")
 
                 try:
@@ -155,6 +168,29 @@ class TranSRT:
 
     @staticmethod
     def parse_file(file_path: str) -> List[SubtitleBlock]:
+        def normalize_spaces(text):
+            return re.sub(r'\s+', ' ', text)
+
+        def filter_bad(text):
+            text = text.replace('dick', 'dic*')
+            text = text.replace('pussy', 'pu**y')
+            text = text.replace('blow job', 'blo* job')
+            text = text.replace('rape', 'rap*')
+            return text
+
+        def filter_bad(text):
+            bad_words = {
+                'dick': 'dic*',
+                'pussy': 'pu**y',
+                'blow job': 'blo* job',
+                'rape': 'rap*',
+                'orgasm': 'orgas*',
+            }
+
+            for word, censored in bad_words.items():
+                text = text.replace(word, censored)
+            return text
+
         with open(file_path, "r", encoding="utf-8") as file:
             content = file.read()
 
@@ -164,11 +200,15 @@ class TranSRT:
         for block in blocks:
             lines = block.strip().split("\n")
             if len(lines) >= 3:
+                text = " ".join(lines[2:]).replace('"', "")
+                text = normalize_spaces(text)
+                text = filter_bad(text)
+
                 parsed_blocks.append(
                     SubtitleBlock(
                         number=int(lines[0]),
                         timestamp=lines[1],
-                        text=" ".join(lines[2:]).replace('"', ""),
+                        text=text
                     )
                 )
 
@@ -260,7 +300,7 @@ def parse_args():
     )
     parser.add_argument(
         "--model",
-        default="gemini-2.0-flash",
+        default="gemini-2.5-flash",
         help="LLM model",
     )
     parser.add_argument(
