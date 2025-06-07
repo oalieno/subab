@@ -11,6 +11,12 @@ from typing import List, NamedTuple, Tuple
 import httpx
 
 
+def parse_timestamp(timestamp: str) -> int:
+    """Convert SRT timestamp to milliseconds for comparison."""
+    hours, minutes, seconds = timestamp.replace(',', '.').split(':')
+    return int(float(hours) * 3600000 + float(minutes) * 60000 + float(seconds) * 1000)
+
+
 def setup_logger(level=logging.INFO, name=__name__):
     # Set root logger to WARNING to suppress other libraries' logs
     logging.getLogger().setLevel(logging.WARNING)
@@ -41,6 +47,9 @@ def setup_logger(level=logging.INFO, name=__name__):
 class TranslationError(Exception): ...
 
 
+class TooManyBlocksError(Exception): ...
+
+
 class SubtitleBlock(NamedTuple):
     number: int
     timestamp: str
@@ -55,21 +64,22 @@ class TranslationResult(NamedTuple):
 
 
 class TranAPI:
-    def __init__(self, api_base: str, model: str = "gemini-2.5-flash", max_retries: int = 3):
+    def __init__(self, api_base: str, model: str = "gemini-2.5-flash", max_retries: int = 3, timeout: float = 60.0):
         self.api_endpoint = f"{api_base}/v1/chat/completions"
         self.model = model
         self.max_retries = max_retries
-        self.client = httpx.AsyncClient(timeout=60.0)
+        self.client = httpx.AsyncClient(timeout=timeout)
 
     def create_prompt(self, texts: List[str]) -> str:
-        return f"""Translate the following English subtitles into Traditional Chinese (繁體中文). Ensure that the tone of your translation matches the context of the subtitles, and adapt idiomatic expressions to fit naturally into Traditional Chinese culture and language.
+        return f"""Translate the following subtitles into Traditional Chinese (繁體中文). Ensure that the tone of your translation matches the context of the subtitles, and adapt idiomatic expressions to fit naturally into Traditional Chinese culture and language.
 
-### Rules:  
-1. **Preserve Line Breaks**: Each English line must correspond to a single Traditional Chinese line in the same array position. Do not combine or merge multiple lines.  
+### Rules:
+1. **Preserve Line Breaks**: Each line must correspond to a single Traditional Chinese line in the same array position. Do not combine or merge multiple lines.  
 2. **Maintain Array Length**: The output array must contain the same number of items (lines) as the input array.  
 3. **Contextual Translations**: Ensure the tone of the translation matches the context of the subtitle (e.g., casual, formal, emotional). Idiomatic expressions should be contextually adapted for naturalness rather than directly translated.  
 4. **Subtitle-Friendly**: Keep translations concise, adhering to typical subtitle length limits. Ensure readability and clarity.  
 5. **Strict Output Format**: Provide the output **ONLY** as a JSON array of strings without any additional comments, explanations, or formatting outside the JSON array. MUST be valid JSON that can be parsed as List[str].
+6. **Name Translation**: All personal names must be translated into Chinese characters, maintaining appropriate cultural context and common Chinese naming conventions.
 
 ### Examples of Correct and Incorrect Formatting:
 
@@ -83,7 +93,7 @@ class TranAPI:
 ["當我目前的奶昔銷量甚至連", "單軸攪拌機的需求都撐不起來呢？對吧？"]
 
 **Input Lines:**
-["- Fuck off. - I’m gonna."]
+["- Back off. - I'm gonna."]
 
 **Incorrect (DO NOT DO THIS):**
 ["- 滾開。", "- 我會的。"]
@@ -162,21 +172,15 @@ Translate the input array below and return only a JSON array of the correspondin
 
 
 class TranSRT:
-    def __init__(self, tran_api: TranAPI, max_concurrent_requests: int):
+    def __init__(self, tran_api: TranAPI, max_concurrent_requests: int, filter_bad_words: bool = False):
         self.tran_api = tran_api
         self.semaphore = Semaphore(max_concurrent_requests)
+        self.filter_bad_words = filter_bad_words
 
     @staticmethod
-    def parse_file(file_path: str) -> List[SubtitleBlock]:
+    def parse_file(file_path: str, filter_bad_words: bool = False) -> List[SubtitleBlock]:
         def normalize_spaces(text):
             return re.sub(r'\s+', ' ', text)
-
-        def filter_bad(text):
-            text = text.replace('dick', 'dic*')
-            text = text.replace('pussy', 'pu**y')
-            text = text.replace('blow job', 'blo* job')
-            text = text.replace('rape', 'rap*')
-            return text
 
         def filter_bad(text):
             bad_words = {
@@ -185,6 +189,9 @@ class TranSRT:
                 'blow job': 'blo* job',
                 'rape': 'rap*',
                 'orgasm': 'orgas*',
+                'had sex': 'haɗ seҳ',
+                'have sex': 'hav* seҳ',
+                'masturbate': 'masturbat*',
             }
 
             for word, censored in bad_words.items():
@@ -196,13 +203,36 @@ class TranSRT:
 
         blocks = content.strip().split("\n\n")
         parsed_blocks = []
+        last_timestamp = -1
+        block_count = 0
 
         for block in blocks:
             lines = block.strip().split("\n")
             if len(lines) >= 3:
-                text = " ".join(lines[2:]).replace('"', "")
+                # Check total number of blocks, some bad srt files have too many blocks
+                block_count += 1
+                if block_count > 5000:
+                    raise TooManyBlocksError(f"SRT file has too many subtitle blocks ({block_count} > 5000), might be broken or malformed")
+
+                timestamp = lines[1].split(" --> ")[0]  # Get start timestamp
+                current_timestamp = parse_timestamp(timestamp)
+                
+                # Stop parsing if timestamp is out of order
+                if current_timestamp < last_timestamp:
+                    logger.info(f"Stopping at subtitle #{lines[0]} due to out-of-order timestamp")
+                    break
+                last_timestamp = current_timestamp
+
+                text = " ".join(lines[2:])
                 text = normalize_spaces(text)
-                text = filter_bad(text)
+                
+                # Skip single character subtitles
+                if len(text.strip()) <= 1:
+                    logger.debug(f"Skipping single character subtitle #{lines[0]}: '{text}'")
+                    continue
+                
+                if filter_bad_words:
+                    text = filter_bad(text)
 
                 parsed_blocks.append(
                     SubtitleBlock(
@@ -247,7 +277,7 @@ class TranSRT:
 
     async def translate_file(self, input_file: str, output_file: str, batch_size: int):
         # Parse input file
-        blocks = self.parse_file(input_file)
+        blocks = self.parse_file(input_file, self.filter_bad_words)
         total_blocks = len(blocks)
 
         # Prepare batches
@@ -293,7 +323,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Translate SRT subtitles to Traditional Chinese"
     )
-    parser.add_argument("input_file", help="Input SRT file path")
+    parser.add_argument("input_path", help="Input SRT file path or folder containing SRT files")
     parser.add_argument(
         "--api-base",
         help="OpenAI API proxy server base URL",
@@ -322,9 +352,20 @@ def parse_args():
         help="Maximum number of concurrent API requests",
     )
     parser.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="Timeout in seconds for API requests",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Force translation even if Chinese version exists",
+    )
+    parser.add_argument(
+        "--filter-bad-words",
+        action="store_true",
+        help="Filter out bad words in subtitles",
     )
     parser.add_argument(
         "--log-level",
@@ -336,6 +377,37 @@ def parse_args():
     return parser.parse_args()
 
 
+async def process_file(input_file: str, tran_srt: TranSRT, args):
+    try:
+        folder, name, lang = parse_srt_filename(input_file)
+
+        # Skip if already Chinese
+        if lang in ["zh-TW", "zh"]:
+            logger.info(f"Already Chinese subtitles: {lang}, ignore...")
+            return
+
+        if not args.force:
+            # check existing translated subtitles
+            for lang in ["zh-TW"]:
+                if (folder / f"{name}.{lang}.srt").exists():
+                    logger.info(
+                        f"Chinese translation already exists for {name}, use --force to translate anyway"
+                    )
+                    return
+
+        try:
+            await tran_srt.translate_file(
+                input_file, str(folder / f"{name}.zh-TW.srt"), args.batch_size
+            )
+        except TooManyBlocksError as e:
+            logger.error(f"Error processing {input_file}: {str(e)}")
+            return False
+    except Exception as e:
+        logger.error(f"Error processing {input_file}: {str(e)}")
+        return False
+    return True
+
+
 async def main():
     global logger
 
@@ -344,31 +416,41 @@ async def main():
     log_level = getattr(logging, args.log_level.upper())
     logger = setup_logger(level=log_level)
 
-    folder, name, lang = parse_srt_filename(args.input_file)
-
-    if lang != "en":
-        print(f"Not english subtitles: {lang}, ignore...")
-        return
-
-    if not args.force:
-        # check existing translated subtitles
-        for lang in ["zh-TW", "zh-TW.hi"]:
-            if (folder / f"{name}.{lang}.srt").exists():
-                print(
-                    "Chinese translation already exist, use --force to translate anyway"
-                )
-                return
-
+    input_path = Path(args.input_path)
+    
+    # Initialize translation API and SRT handler
     tran_api = TranAPI(
         api_base=args.api_base,
         model=args.model,
         max_retries=args.max_retries,
+        timeout=args.timeout,
     )
-    tran_srt = TranSRT(tran_api=tran_api, max_concurrent_requests=args.max_concurrent)
+    tran_srt = TranSRT(
+        tran_api=tran_api,
+        max_concurrent_requests=args.max_concurrent,
+        filter_bad_words=args.filter_bad_words,
+    )
 
-    await tran_srt.translate_file(
-        args.input_file, str(folder / f"{name}.zh-TW.srt"), args.batch_size
-    )
+    if input_path.is_file():
+        # Process single file
+        if not input_path.name.endswith(".srt"):
+            logger.error(f"Not .srt file: {input_path}")
+            return
+        await process_file(str(input_path), tran_srt, args)
+    elif input_path.is_dir():
+        # Process all .srt files in directory
+        srt_files = list(input_path.glob("**/*.srt"))
+        if not srt_files:
+            logger.error(f"No .srt files found in {input_path}")
+            return
+            
+        logger.info(f"Found {len(srt_files)} .srt files to process")
+        for srt_file in srt_files:
+            logger.info(f"Processing {srt_file}")
+            await process_file(str(srt_file), tran_srt, args)
+    else:
+        logger.error(f"Input path does not exist: {input_path}")
+        return
 
 
 if __name__ == "__main__":
