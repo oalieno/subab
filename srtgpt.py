@@ -64,10 +64,12 @@ class TranslationResult(NamedTuple):
 
 
 class TranAPI:
-    def __init__(self, api_base: str, model: str = "gemini-2.5-flash", max_retries: int = 3, timeout: float = 60.0):
+    def __init__(self, api_base: str, api_key: str, model: str = "gemini-2.5-flash", max_retries: int = 3, timeout: float = 60.0, initial_delay: float = 1.0):
         self.api_endpoint = f"{api_base}/v1/chat/completions"
+        self.api_key = api_key
         self.model = model
         self.max_retries = max_retries
+        self.initial_delay = initial_delay
         self.client = httpx.AsyncClient(timeout=timeout)
 
     def create_prompt(self, texts: List[str]) -> str:
@@ -113,9 +115,15 @@ Translate the input array below and return only a JSON array of the correspondin
             try:
                 response = await self.client.post(
                     self.api_endpoint,
-                    headers={"Content-Type": "application/json"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.api_key}"
+                    },
                     json={
                         "model": self.model,
+                        "stream": False,
+                        "temperature": 0.2,
+                        "top_p": 1,
                         "messages": [{"role": "user", "content": content}],
                     },
                 )
@@ -124,7 +132,7 @@ Translate the input array below and return only a JSON array of the correspondin
                 result = response.json()
                 return result["choices"][0]["message"]["content"]
             except Exception as e:
-                delay_time = 2**i
+                delay_time = self.initial_delay * (2 ** i)
                 logger.error(
                     f"Error in API: {str(e)}. Retrying in {delay_time} seconds..."
                 )
@@ -329,6 +337,11 @@ def parse_args():
         help="OpenAI API proxy server base URL",
     )
     parser.add_argument(
+        "--api-key",
+        required=True,
+        help="API key for authentication",
+    )
+    parser.add_argument(
         "--model",
         default="gemini-2.5-flash",
         help="LLM model",
@@ -344,6 +357,12 @@ def parse_args():
         type=int,
         default=3,
         help="Maximum number of retries for failed requests",
+    )
+    parser.add_argument(
+        "--initial-delay",
+        type=float,
+        default=1.0,
+        help="Initial delay time in seconds for retries (will be doubled each retry)",
     )
     parser.add_argument(
         "--max-concurrent",
@@ -421,9 +440,11 @@ async def main():
     # Initialize translation API and SRT handler
     tran_api = TranAPI(
         api_base=args.api_base,
+        api_key=args.api_key,
         model=args.model,
         max_retries=args.max_retries,
         timeout=args.timeout,
+        initial_delay=args.initial_delay,
     )
     tran_srt = TranSRT(
         tran_api=tran_api,
