@@ -4,17 +4,20 @@ import asyncio
 import json
 import logging
 from asyncio import Semaphore
-from datetime import datetime
 from pathlib import Path
 from typing import List, NamedTuple, Tuple
 
-import httpx
+import httpx  # type: ignore
 
 
 def parse_timestamp(timestamp: str) -> int:
     """Convert SRT timestamp to milliseconds for comparison."""
-    hours, minutes, seconds = timestamp.replace(',', '.').split(':')
-    return int(float(hours) * 3600000 + float(minutes) * 60000 + float(seconds) * 1000)
+    try:
+        hours, minutes, seconds = timestamp.replace(',', '.').split(':')
+        return int(float(hours) * 3600000 + float(minutes) * 60000 + float(seconds) * 1000)
+    except (ValueError, AttributeError) as e:
+        logger.warning(f"Failed to parse timestamp '{timestamp}': {e}")
+        return -1
 
 
 def setup_logger(level=logging.INFO, name=__name__):
@@ -50,6 +53,13 @@ class TranslationError(Exception): ...
 class TooManyBlocksError(Exception): ...
 
 
+class RateLimitError(Exception):
+    """Rate limit exceeded, should wait before retrying."""
+    def __init__(self, message: str, retry_after: float = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class SubtitleBlock(NamedTuple):
     number: int
     timestamp: str
@@ -70,7 +80,23 @@ class TranAPI:
         self.model = model
         self.max_retries = max_retries
         self.initial_delay = initial_delay
-        self.client = httpx.AsyncClient(timeout=timeout)
+        self.timeout = timeout
+        self._client = None
+
+    async def __aenter__(self):
+        self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._client:
+            await self._client.aclose()
+        return False
+
+    @property
+    def client(self):
+        if self._client is None:
+            raise RuntimeError("TranAPI must be used as async context manager")
+        return self._client
 
     def create_prompt(self, texts: List[str]) -> str:
         return f"""Translate the following subtitles into Traditional Chinese (繁體中文). Ensure that the tone of your translation matches the context of the subtitles, and adapt idiomatic expressions to fit naturally into Traditional Chinese culture and language.
@@ -110,8 +136,10 @@ Translate the input array below and return only a JSON array of the correspondin
 {json.dumps(texts, ensure_ascii=False)}
 """
 
-    async def llm(self, content: str) -> dict:
-        for i in range(self.max_retries):
+    async def llm(self, content: str) -> str:
+        last_exception = None
+        
+        for attempt in range(self.max_retries):
             try:
                 response = await self.client.post(
                     self.api_endpoint,
@@ -127,18 +155,99 @@ Translate the input array below and return only a JSON array of the correspondin
                         "messages": [{"role": "user", "content": content}],
                     },
                 )
+                
+                # Handle different HTTP status codes
+                if response.status_code == 429:
+                    # Rate limit - check for Retry-After header
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait_time = float(retry_after)
+                        except ValueError:
+                            wait_time = self.initial_delay * (2 ** attempt)
+                    else:
+                        wait_time = self.initial_delay * (2 ** attempt)
+                    
+                    logger.warning(f"Rate limit exceeded (429). Waiting {wait_time:.1f}s before retry {attempt + 1}/{self.max_retries}")
+                    await asyncio.sleep(wait_time)
+                    last_exception = RateLimitError("Rate limit exceeded", wait_time)
+                    continue
+                
+                elif 400 <= response.status_code < 500:
+                    # Client errors (except 429) - don't retry
+                    error_msg = "Client error {}: {}".format(response.status_code, response.text)
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+                
+                elif 500 <= response.status_code < 600:
+                    # Server errors - retry with backoff
+                    delay_time = self.initial_delay * (2 ** attempt)
+                    logger.warning(f"Server error {response.status_code}. Retrying in {delay_time:.1f}s (attempt {attempt + 1}/{self.max_retries})")
+                    await asyncio.sleep(delay_time)
+                    last_exception = RuntimeError(f"Server error {response.status_code}")
+                    continue
+                
+                # Successful response
                 response.raise_for_status()
-
-                result = response.json()
+                
+                # Parse and validate response
+                try:
+                    result = response.json()
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid JSON response: {response.text}")
+                    raise RuntimeError(f"Invalid JSON response from API: {e}")
+                
+                # Validate response structure
+                if not isinstance(result, dict):
+                    raise RuntimeError(f"Unexpected response type: {type(result)}")
+                
+                if "choices" not in result:
+                    raise RuntimeError(f"Missing 'choices' in API response: {result}")
+                
+                if not result["choices"] or len(result["choices"]) == 0:
+                    raise RuntimeError(f"Empty 'choices' in API response: {result}")
+                
+                if "message" not in result["choices"][0]:
+                    raise RuntimeError(f"Missing 'message' in API response: {result}")
+                
+                if "content" not in result["choices"][0]["message"]:
+                    raise RuntimeError(f"Missing 'content' in API response: {result}")
+                
                 return result["choices"][0]["message"]["content"]
-            except Exception as e:
-                delay_time = self.initial_delay * (2 ** i)
-                logger.error(
-                    f"Error in API: {str(e)}. Retrying in {delay_time} seconds..."
-                )
+                
+            except httpx.TimeoutException as e:
+                delay_time = self.initial_delay * (2 ** attempt)
+                logger.warning(f"Request timeout. Retrying in {delay_time:.1f}s (attempt {attempt + 1}/{self.max_retries})")
                 await asyncio.sleep(delay_time)
+                last_exception = e
+                
+            except httpx.NetworkError as e:
+                delay_time = self.initial_delay * (2 ** attempt)
+                logger.warning(f"Network error: {str(e)}. Retrying in {delay_time:.1f}s (attempt {attempt + 1}/{self.max_retries})")
+                await asyncio.sleep(delay_time)
+                last_exception = e
+                
+            except RuntimeError:
+                # Don't retry RuntimeError (client errors, validation errors)
+                raise
+                
+            except Exception as e:
+                delay_time = self.initial_delay * (2 ** attempt)
+                logger.error(f"Unexpected error: {str(e)}. Retrying in {delay_time:.1f}s (attempt {attempt + 1}/{self.max_retries})")
+                await asyncio.sleep(delay_time)
+                last_exception = e
 
-        raise RuntimeError(f"API failed after {self.max_retries} retries")
+        raise RuntimeError(f"API failed after {self.max_retries} retries. Last error: {last_exception}")
+
+    @staticmethod
+    def clean_json_trailing_commas(json_str: str) -> str:
+        """Remove trailing commas from JSON string that would cause parsing errors."""
+        # Remove trailing commas before closing brackets/braces
+        # Pattern 1: , followed by optional whitespace and ]
+        json_str = re.sub(r',(\s*])', r'\1', json_str)
+        # Pattern 2: , followed by optional whitespace and }
+        json_str = re.sub(r',(\s*})', r'\1', json_str)
+        return json_str
 
     async def translate(self, texts: List[str]) -> List[str]:
         for _ in range(2):
@@ -153,8 +262,13 @@ Translate the input array below and return only a JSON array of the correspondin
                     raise TranslationError("No JSON array found in response")
 
                 try:
-                    translated_list = json.loads(translated_text[start : end + 1])
-                except json.decoder.JSONDecodeError:
+                    json_text = translated_text[start : end + 1]
+                    # Clean trailing commas before parsing
+                    json_text = self.clean_json_trailing_commas(json_text)
+                    translated_list = json.loads(json_text)
+                except json.decoder.JSONDecodeError as e:
+                    logger.debug(f"JSON decode error: {str(e)}")
+                    logger.debug(f"Problematic JSON: {translated_text[start : end + 1]}")
                     raise TranslationError("Not a valid JSON")
 
                 if len(translated_list) != len(texts):
@@ -203,52 +317,94 @@ class TranSRT:
             }
 
             for word, censored in bad_words.items():
-                text = text.replace(word, censored)
+                # Case-insensitive replacement
+                text = re.sub(re.escape(word), censored, text, flags=re.IGNORECASE)
             return text
 
-        with open(file_path, "r", encoding="utf-8") as file:
-            content = file.read()
+        try:
+            with open(file_path, "r", encoding="utf-8") as file:
+                content = file.read()
+        except UnicodeDecodeError:
+            # Try with different encoding
+            logger.warning(f"Failed to read {file_path} with UTF-8, trying with latin-1")
+            with open(file_path, "r", encoding="latin-1") as file:
+                content = file.read()
+        except FileNotFoundError:
+            raise FileNotFoundError(f"File not found: {file_path}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to read file {file_path}: {e}")
 
         blocks = content.strip().split("\n\n")
         parsed_blocks = []
         last_timestamp = -1
         block_count = 0
 
-        for block in blocks:
+        for block_idx, block in enumerate(blocks):
             lines = block.strip().split("\n")
             if len(lines) >= 3:
-                # Check total number of blocks, some bad srt files have too many blocks
-                block_count += 1
-                if block_count > 5000:
-                    raise TooManyBlocksError(f"SRT file has too many subtitle blocks ({block_count} > 5000), might be broken or malformed")
+                try:
+                    # Check total number of blocks, some bad srt files have too many blocks
+                    block_count += 1
+                    if block_count > 5000:
+                        raise TooManyBlocksError(f"SRT file has too many subtitle blocks ({block_count} > 5000), might be broken or malformed")
 
-                timestamp = lines[1].split(" --> ")[0]  # Get start timestamp
-                current_timestamp = parse_timestamp(timestamp)
-                
-                # Stop parsing if timestamp is out of order
-                if current_timestamp < last_timestamp:
-                    logger.info(f"Stopping at subtitle #{lines[0]} due to out-of-order timestamp")
-                    break
-                last_timestamp = current_timestamp
+                    # Parse subtitle number
+                    try:
+                        subtitle_number = int(lines[0])
+                    except ValueError:
+                        logger.debug(f"Skipping block {block_idx}: invalid subtitle number '{lines[0]}'")
+                        continue
 
-                text = " ".join(lines[2:])
-                text = normalize_spaces(text)
-                
-                # Skip single character subtitles
-                if len(text.strip()) <= 1:
-                    logger.debug(f"Skipping single character subtitle #{lines[0]}: '{text}'")
-                    continue
-                
-                if filter_bad_words:
-                    text = filter_bad(text)
+                    # Parse timestamp
+                    if " --> " not in lines[1]:
+                        logger.debug(f"Skipping block {block_idx}: invalid timestamp format '{lines[1]}'")
+                        continue
+                    
+                    timestamp_parts = lines[1].split(" --> ")
+                    if len(timestamp_parts) != 2:
+                        logger.debug(f"Skipping block {block_idx}: malformed timestamp '{lines[1]}'")
+                        continue
+                    
+                    timestamp = timestamp_parts[0]
+                    current_timestamp = parse_timestamp(timestamp)
+                    
+                    # Skip if timestamp parsing failed
+                    if current_timestamp == -1:
+                        logger.debug(f"Skipping block {block_idx}: failed to parse timestamp")
+                        continue
+                    
+                    # Stop parsing if timestamp is out of order
+                    if current_timestamp < last_timestamp:
+                        logger.info(f"Stopping at subtitle #{lines[0]} due to out-of-order timestamp")
+                        break
+                    last_timestamp = current_timestamp
 
-                parsed_blocks.append(
-                    SubtitleBlock(
-                        number=int(lines[0]),
-                        timestamp=lines[1],
-                        text=text
+                    text = " ".join(lines[2:])
+                    text = normalize_spaces(text)
+                    
+                    # Skip single character subtitles
+                    if len(text.strip()) <= 1:
+                        logger.debug(f"Skipping single character subtitle #{lines[0]}: '{text}'")
+                        continue
+                    
+                    if filter_bad_words:
+                        text = filter_bad(text)
+
+                    parsed_blocks.append(
+                        SubtitleBlock(
+                            number=subtitle_number,
+                            timestamp=lines[1],
+                            text=text
+                        )
                     )
-                )
+                except TooManyBlocksError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"Error parsing block {block_idx}: {e}. Skipping...")
+                    continue
+
+        if not parsed_blocks:
+            raise ValueError(f"No valid subtitle blocks found in {file_path}")
 
         return parsed_blocks
 
@@ -319,12 +475,27 @@ class TranSRT:
 
 
 def parse_srt_filename(input_path: str) -> Tuple[Path, str, str]:
-    if not input_path.endswith(".srt"):
+    """Parse SRT filename to extract folder, name, and language."""
+    path = Path(input_path)
+    
+    if path.suffix != ".srt":
         raise ValueError(f"Not .srt file: {input_path}")
-
-    name, _, lang = input_path[:-4].replace(".hi", "").rpartition(".")
-    folder, _, name = name.rpartition("/")
-    return Path(folder), name, lang
+    
+    # Remove .srt extension
+    stem = path.stem
+    
+    # Remove .hi if present (hearing impaired)
+    stem = stem.replace(".hi", "")
+    
+    # Extract language (last part after .)
+    parts = stem.rsplit(".", 1)
+    if len(parts) == 2:
+        name, lang = parts
+    else:
+        name = stem
+        lang = ""
+    
+    return path.parent, name, lang
 
 
 def parse_args():
@@ -437,42 +608,72 @@ async def main():
 
     input_path = Path(args.input_path)
     
-    # Initialize translation API and SRT handler
-    tran_api = TranAPI(
+    # Validate input path
+    if not input_path.exists():
+        logger.error(f"Input path does not exist: {input_path}")
+        return 1
+    
+    # Initialize translation API and SRT handler with context manager
+    async with TranAPI(
         api_base=args.api_base,
         api_key=args.api_key,
         model=args.model,
         max_retries=args.max_retries,
         timeout=args.timeout,
         initial_delay=args.initial_delay,
-    )
-    tran_srt = TranSRT(
-        tran_api=tran_api,
-        max_concurrent_requests=args.max_concurrent,
-        filter_bad_words=args.filter_bad_words,
-    )
+    ) as tran_api:
+        tran_srt = TranSRT(
+            tran_api=tran_api,
+            max_concurrent_requests=args.max_concurrent,
+            filter_bad_words=args.filter_bad_words,
+        )
 
-    if input_path.is_file():
-        # Process single file
-        if not input_path.name.endswith(".srt"):
-            logger.error(f"Not .srt file: {input_path}")
-            return
-        await process_file(str(input_path), tran_srt, args)
-    elif input_path.is_dir():
-        # Process all .srt files in directory
-        srt_files = list(input_path.glob("**/*.srt"))
-        if not srt_files:
-            logger.error(f"No .srt files found in {input_path}")
-            return
-            
-        logger.info(f"Found {len(srt_files)} .srt files to process")
-        for srt_file in srt_files:
-            logger.info(f"Processing {srt_file}")
-            await process_file(str(srt_file), tran_srt, args)
-    else:
-        logger.error(f"Input path does not exist: {input_path}")
-        return
+        try:
+            if input_path.is_file():
+                # Process single file
+                if not input_path.name.endswith(".srt"):
+                    logger.error(f"Not .srt file: {input_path}")
+                    return 1
+                success = await process_file(str(input_path), tran_srt, args)
+                return 0 if success else 1
+                
+            elif input_path.is_dir():
+                # Process all .srt files in directory
+                srt_files = list(input_path.glob("**/*.srt"))
+                if not srt_files:
+                    logger.error(f"No .srt files found in {input_path}")
+                    return 1
+                
+                logger.info(f"Found {len(srt_files)} .srt files to process")
+                failed_files = []
+                
+                for srt_file in srt_files:
+                    logger.info(f"Processing {srt_file}")
+                    success = await process_file(str(srt_file), tran_srt, args)
+                    if success is False:
+                        failed_files.append(srt_file)
+                
+                if failed_files:
+                    logger.error(f"Failed to process {len(failed_files)} files:")
+                    for f in failed_files:
+                        logger.error(f"  - {f}")
+                    return 1
+                
+                logger.info("All files processed successfully")
+                return 0
+            else:
+                logger.error(f"Invalid input path: {input_path}")
+                return 1
+                
+        except KeyboardInterrupt:
+            logger.warning("Process interrupted by user")
+            return 130  # Standard exit code for SIGINT
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    exit_code = asyncio.run(main())
+    sys.exit(exit_code or 0)
