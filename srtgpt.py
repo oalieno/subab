@@ -20,6 +20,19 @@ def parse_timestamp(timestamp: str) -> int:
         return -1
 
 
+def ms_to_timestamp(ms: int) -> str:
+    """Convert milliseconds to SRT timestamp format."""
+    if ms < 0:
+        ms = 0
+    hours = ms // 3600000
+    ms %= 3600000
+    minutes = ms // 60000
+    ms %= 60000
+    seconds = ms // 1000
+    milliseconds = ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+
 def setup_logger(level=logging.INFO, name=__name__):
     # Set root logger to WARNING to suppress other libraries' logs
     logging.getLogger().setLevel(logging.WARNING)
@@ -98,39 +111,38 @@ class TranAPI:
             raise RuntimeError("TranAPI must be used as async context manager")
         return self._client
 
-    def create_prompt(self, texts: List[str]) -> str:
-        return f"""Translate the following subtitles into Traditional Chinese (繁體中文). Ensure that the tone of your translation matches the context of the subtitles, and adapt idiomatic expressions to fit naturally into Traditional Chinese culture and language.
+    def create_prompt(self, texts: List[str], target_language: str) -> str:
+        return f"""Translate the following subtitles into {target_language}. Your main goal is to produce a natural and accurate translation while strictly preserving the original subtitle structure.
 
-### Rules:
-1. **Preserve Line Breaks**: Each line must correspond to a single Traditional Chinese line in the same array position. Do not combine or merge multiple lines.  
-2. **Maintain Array Length**: The output array must contain the same number of items (lines) as the input array.  
-3. **Contextual Translations**: Ensure the tone of the translation matches the context of the subtitle (e.g., casual, formal, emotional). Idiomatic expressions should be contextually adapted for naturalness rather than directly translated.  
-4. **Subtitle-Friendly**: Keep translations concise, adhering to typical subtitle length limits. Ensure readability and clarity.  
-5. **Strict Output Format**: Provide the output **ONLY** as a JSON array of strings without any additional comments, explanations, or formatting outside the JSON array. MUST be valid JSON that can be parsed as List[str].
-6. **Name Translation**: All personal names must be translated into Chinese characters, maintaining appropriate cultural context and common Chinese naming conventions.
+### Core Rules:
+1.  **1-to-1 Line Mapping**: Each string in the input JSON array corresponds to one line of subtitle. Your output must be a JSON array with the exact same number of strings. Do not merge lines or split lines.
+2.  **Contextual Accuracy**: Ensure the tone (e.g., casual, formal) and meaning match the original context. Adapt idioms naturally into {target_language}.
+3.  **Conciseness**: Keep translations subtitle-friendly—clear and easy to read quickly.
+4.  **Strict JSON Output**: The output MUST be a valid JSON array of strings. Do not include any explanations, markdown, or any text outside of the JSON array.
+5.  **Name Translation**: All personal names must be translated or transliterated into {target_language}, maintaining appropriate cultural context and common naming conventions for that language.
 
-### Examples of Correct and Incorrect Formatting:
+### Structural Examples (How to handle line breaks):
 
-**Input Lines:**
-["when I barely sell enough milkshakes", "to justify my single spindle? Right?"]
+These examples illustrate the structural rules. You will translate the content into {target_language}.
 
-**Incorrect (DO NOT DO THIS):**
-["當我目前的奶昔銷量甚至連單軸攪拌機的需求都撐不起來呢？對吧？"]
+**Example 1: Preserving intended line breaks.**
+*   **Input Lines**: `["when I barely sell enough milkshakes", "to justify my single spindle? Right?"]`
+*   **Analysis**: The original subtitle was intentionally split into two lines, likely for timing or readability.
+*   **Correct Output Structure**: The translation must also be a JSON array of two strings.
+    `["<translation of first line>", "<translation of second line>"]`
+*   **Incorrect Output Structure (DO NOT DO THIS)**: Merging the lines into one string.
+    `["<translation of both lines combined into one>"]`
 
-**Correct (DO THIS):**
-["當我目前的奶昔銷量甚至連", "單軸攪拌機的需求都撐不起來呢？對吧？"]
-
-**Input Lines:**
-["- Back off. - I'm gonna."]
-
-**Incorrect (DO NOT DO THIS):**
-["- 滾開。", "- 我會的。"]
-
-**Correct (DO THIS):**
-["- 滾開。- 我會的。"]
+**Example 2: Keeping single-line dialogues intact.**
+*   **Input Lines**: `["- Back off. - I'm gonna."]`
+*   **Analysis**: This is a single line containing a quick exchange. It should remain a single line.
+*   **Correct Output Structure**: The translation must be a JSON array with a single string.
+    `["<translation of the full line>"]`
+*   **Incorrect Output Structure (DO NOT DO THIS)**: Splitting one line into multiple strings in the array.
+    `["<translation of '- Back off.'>", "<translation of '- I'm gonna.'>"]`
 
 ### Your Task:
-Translate the input array below and return only a JSON array of the corresponding Traditional Chinese translations.
+Translate the following input array into {target_language}, strictly following all the rules above.
 
 **Input Lines:**
 {json.dumps(texts, ensure_ascii=False)}
@@ -249,10 +261,10 @@ Translate the input array below and return only a JSON array of the correspondin
         json_str = re.sub(r',(\s*})', r'\1', json_str)
         return json_str
 
-    async def translate(self, texts: List[str]) -> List[str]:
+    async def translate(self, texts: List[str], target_language: str) -> List[str]:
         for _ in range(2):
             try:
-                prompt = self.create_prompt(texts)
+                prompt = self.create_prompt(texts, target_language)
                 translated_text = await self.llm(prompt)
 
                 start, end = translated_text.find("["), translated_text.rfind("]")
@@ -277,7 +289,7 @@ Translate the input array below and return only a JSON array of the correspondin
                     )
 
                 if not all(isinstance(text, str) for text in translated_list):
-                    raise TranslationError("Not all translations are strings")
+                    raise TranslationError(f"Not all translations are strings: {translated_list}")
 
                 return translated_list
 
@@ -288,8 +300,8 @@ Translate the input array below and return only a JSON array of the correspondin
         if len(texts) == 1:
             raise RuntimeError("Translation failed after many tries...")
 
-        return await self.translate(texts[: len(texts) // 2]) + await self.translate(
-            texts[len(texts) // 2 :]
+        return await self.translate(texts[: len(texts) // 2], target_language) + await self.translate(
+            texts[len(texts) // 2 :], target_language
         )
 
 
@@ -416,21 +428,29 @@ class TranSRT:
                 file.write(f"{block.timestamp}\n")
                 file.write(f"{block.text}\n\n")
 
+    @staticmethod
+    def post_process_translation(text: str) -> str:
+        """Applies various post-processing cleanups to the translated text."""
+        # Split dialogues like "- Hello - World" into separate lines for readability.
+        # This is a simple replacement and won't affect hyphens within words.
+        return text.replace(" - ", "\n- ")
+
     async def translate_batch(
         self,
         batch: List[SubtitleBlock],
         batch_num: int,
         total_batches: int,
+        target_language: str,
     ) -> List[TranslationResult]:
         async with self.semaphore:
             texts = [block.text for block in batch]
-            translated_texts = await self.tran_api.translate(texts)
+            translated_texts = await self.tran_api.translate(texts, target_language)
 
             results = [
                 TranslationResult(
                     number=block.number,
                     timestamp=block.timestamp,
-                    text=translated_text,
+                    text=self.post_process_translation(translated_text),
                     original_text=block.text,
                 )
                 for block, translated_text in zip(batch, translated_texts)
@@ -439,7 +459,7 @@ class TranSRT:
             logger.info(f"Batch {batch_num}/{total_batches}: Completed")
             return results
 
-    async def translate_file(self, input_file: str, output_file: str, batch_size: int):
+    async def translate_file(self, input_file: str, output_file: str, batch_size: int, target_language: str, model_name: str, no_header: bool):
         # Parse input file
         blocks = self.parse_file(input_file, self.filter_bad_words)
         total_blocks = len(blocks)
@@ -453,7 +473,7 @@ class TranSRT:
         translated_blocks = []
 
         tasks = [
-            self.translate_batch(batch, i + 1, len(batches))
+            self.translate_batch(batch, i + 1, len(batches), target_language)
             for i, batch in enumerate(batches)
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -465,12 +485,43 @@ class TranSRT:
             else:
                 translated_blocks.extend(result)
 
-        # Sort and write results
+        # Sort results by subtitle number
         translated_blocks.sort(key=lambda x: x.number)
-        self.write_file(output_file, translated_blocks)
+
+        # Add header block if not disabled
+        if translated_blocks and not no_header:
+            header_text = f"Translated by srtgpt (model: {model_name})"
+            first_block_start_ms = parse_timestamp(
+                translated_blocks[0].timestamp.split(" --> ")[0]
+            )
+
+            header_end_ms = 5000  # Default 5 seconds
+            if 0 < first_block_start_ms < header_end_ms:
+                header_end_ms = first_block_start_ms - 1
+
+            header_timestamp = f"00:00:00,000 --> {ms_to_timestamp(header_end_ms)}"
+
+            header_block = TranslationResult(
+                number=0,  # Placeholder, will be renumbered
+                timestamp=header_timestamp,
+                text=header_text,
+                original_text="",
+            )
+
+            translated_blocks.insert(0, header_block)
+
+            # Renumber all blocks starting from 1
+            final_blocks = [
+                block._replace(number=i + 1) for i, block in enumerate(translated_blocks)
+            ]
+        else:
+            final_blocks = translated_blocks
+
+        # Write final result to file
+        self.write_file(output_file, final_blocks)
 
         logger.info(
-            f"Translation completed: {len(translated_blocks)}/{total_blocks} subtitles"
+            f"Translation completed: {len(final_blocks)} subtitles"
         )
 
 
@@ -500,11 +551,12 @@ def parse_srt_filename(input_path: str) -> Tuple[Path, str, str]:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Translate SRT subtitles to Traditional Chinese"
+        description="Translate SRT subtitles using an OpenAI-compatible API."
     )
     parser.add_argument("input_path", help="Input SRT file path or folder containing SRT files")
     parser.add_argument(
         "--api-base",
+        required=True,
         help="OpenAI API proxy server base URL",
     )
     parser.add_argument(
@@ -513,14 +565,30 @@ def parse_args():
         help="API key for authentication",
     )
     parser.add_argument(
+        "--target-language",
+        default="Traditional Chinese",
+        help="The target language for translation (e.g., 'English', 'Japanese', 'Traditional Chinese')",
+    )
+    parser.add_argument(
+        "--target-lang-code",
+        default="zh-TW",
+        help="The target language code for the output filename (e.g., 'en', 'ja', 'zh-TW')",
+    )
+    parser.add_argument(
+        "--also-skip",
+        nargs="*",
+        default=[],
+        help="Also skip translating if files with these language codes exist (e.g., for target 'zh-TW', you might want to skip if 'zh' exists).",
+    )
+    parser.add_argument(
         "--model",
-        default="gemini-2.5-flash",
+        required=True,
         help="LLM model",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=32,
+        default=128,
         help="Number of subtitles to translate in one batch",
     )
     parser.add_argument(
@@ -558,6 +626,11 @@ def parse_args():
         help="Filter out bad words in subtitles",
     )
     parser.add_argument(
+        "--no-header",
+        action="store_true",
+        help="Do not add a header with translation info to the SRT file",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -570,24 +643,26 @@ def parse_args():
 async def process_file(input_file: str, tran_srt: TranSRT, args):
     try:
         folder, name, lang = parse_srt_filename(input_file)
+        target_lang_code = args.target_lang_code
+        skip_codes = [target_lang_code] + args.also_skip
 
-        # Skip if already Chinese
-        if lang in ["zh-TW", "zh"]:
-            logger.info(f"Already Chinese subtitles: {lang}, ignore...")
+        # Skip if input file is already in one of the target languages
+        if lang in skip_codes:
+            logger.info(f"Input subtitle language '{lang}' is in the list of languages to skip. Skipping.")
             return
 
         if not args.force:
             # check existing translated subtitles
-            for lang in ["zh-TW"]:
-                if (folder / f"{name}.{lang}.srt").exists():
+            for code in skip_codes:
+                if (folder / f"{name}.{code}.srt").exists():
                     logger.info(
-                        f"Chinese translation already exists for {name}, use --force to translate anyway"
+                        f"Found existing translated file '{name}.{code}.srt'. Skipping. Use --force to translate anyway."
                     )
                     return
 
         try:
             await tran_srt.translate_file(
-                input_file, str(folder / f"{name}.zh-TW.srt"), args.batch_size
+                input_file, str(folder / f"{name}.{target_lang_code}.srt"), args.batch_size, args.target_language, args.model, args.no_header
             )
         except TooManyBlocksError as e:
             logger.error(f"Error processing {input_file}: {str(e)}")
