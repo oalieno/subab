@@ -1,0 +1,9 @@
+[project]
+name = "subab"
+version = "0.1.0"
+description = "A lightweight CLI tool to translate .srt subtitle files with any OpenAI-compatible LLM API."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+]

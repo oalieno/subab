@@ -490,7 +490,7 @@ class TranSRT:
 
         # Add header block if not disabled
         if translated_blocks and not no_header:
-            header_text = f"Translated by srtgpt (model: {model_name})"
+            header_text = f"Translated by SubAB (model: {model_name})"
             first_block_start_ms = parse_timestamp(
                 translated_blocks[0].timestamp.split(" --> ")[0]
             )
@@ -586,10 +586,10 @@ def parse_args():
         help="LLM model",
     )
     parser.add_argument(
-        "--batch-size",
+        "--max-batch-size",
         type=int,
         default=128,
-        help="Number of subtitles to translate in one batch",
+        help="Maximum number of subtitles to translate in one batch",
     )
     parser.add_argument(
         "--max-retries",
@@ -662,7 +662,7 @@ async def process_file(input_file: str, tran_srt: TranSRT, args):
 
         try:
             await tran_srt.translate_file(
-                input_file, str(folder / f"{name}.{target_lang_code}.srt"), args.batch_size, args.target_language, args.model, args.no_header
+                input_file, str(folder / f"{name}.{target_lang_code}.srt"), args.max_batch_size, args.target_language, args.model, args.no_header
             )
         except TooManyBlocksError as e:
             logger.error(f"Error processing {input_file}: {str(e)}")
