@@ -1,36 +1,18 @@
-import re
 import argparse
 import asyncio
 import json
 import logging
+import random
+import re
+import secrets
+import sys
 from asyncio import Semaphore
+from datetime import timedelta
 from pathlib import Path
-from typing import List, NamedTuple, Tuple
 
-import httpx  # type: ignore
-
-
-def parse_timestamp(timestamp: str) -> int:
-    """Convert SRT timestamp to milliseconds for comparison."""
-    try:
-        hours, minutes, seconds = timestamp.replace(',', '.').split(':')
-        return int(float(hours) * 3600000 + float(minutes) * 60000 + float(seconds) * 1000)
-    except (ValueError, AttributeError) as e:
-        logger.warning(f"Failed to parse timestamp '{timestamp}': {e}")
-        return -1
-
-
-def ms_to_timestamp(ms: int) -> str:
-    """Convert milliseconds to SRT timestamp format."""
-    if ms < 0:
-        ms = 0
-    hours = ms // 3600000
-    ms %= 3600000
-    minutes = ms // 60000
-    ms %= 60000
-    seconds = ms // 1000
-    milliseconds = ms % 1000
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+import httpx
+import json_repair
+import srt
 
 
 def setup_logger(level=logging.INFO, name=__name__):
@@ -63,31 +45,30 @@ def setup_logger(level=logging.INFO, name=__name__):
 class TranslationError(Exception): ...
 
 
-class TooManyBlocksError(Exception): ...
-
-
 class RateLimitError(Exception):
     """Rate limit exceeded, should wait before retrying."""
+
     def __init__(self, message: str, retry_after: float = None):
         super().__init__(message)
         self.retry_after = retry_after
 
 
-class SubtitleBlock(NamedTuple):
-    number: int
-    timestamp: str
-    text: str
+class ServerError(Exception):
+    """Server error, should retry."""
+
+    ...
 
 
-class TranslationResult(NamedTuple):
-    number: int
-    timestamp: str
-    text: str
-    original_text: str
-
-
-class TranAPI:
-    def __init__(self, api_base: str, api_key: str, model: str = "gemini-2.5-flash", max_retries: int = 3, timeout: float = 60.0, initial_delay: float = 1.0):
+class LLMAPI:
+    def __init__(
+        self,
+        api_base: str,
+        api_key: str,
+        model: str,
+        max_retries: int = 3,
+        timeout: float = 60.0,
+        initial_delay: float = 30.0,
+    ):
         self.api_endpoint = f"{api_base}/v1/chat/completions"
         self.api_key = api_key
         self.model = model
@@ -111,53 +92,32 @@ class TranAPI:
             raise RuntimeError("TranAPI must be used as async context manager")
         return self._client
 
-    def create_prompt(self, texts: List[str], target_language: str) -> str:
-        return f"""Translate the following subtitles into {target_language}. Your main goal is to produce a natural and accurate translation while strictly preserving the original subtitle structure.
+    async def _backoff(
+        self, attempt: int, reason: str, *, retry_after: float | None = None
+    ):
+        base_wait = (
+            retry_after
+            if retry_after is not None
+            else self.initial_delay * (2**attempt)
+        )
+        # Add small jitter to avoid thundering herd
+        jitter = 0.8 + (random.random() * 0.4)
+        wait_time = base_wait * jitter
+        logger.warning(
+            f"{reason}. Retrying in {wait_time:.1f}s (base {base_wait:.1f}s, attempt {attempt + 1}/{self.max_retries})"
+        )
+        await asyncio.sleep(wait_time)
 
-### Core Rules:
-1.  **1-to-1 Line Mapping**: Each string in the input JSON array corresponds to one line of subtitle. Your output must be a JSON array with the exact same number of strings. Do not merge lines or split lines.
-2.  **Contextual Accuracy**: Ensure the tone (e.g., casual, formal) and meaning match the original context. Adapt idioms naturally into {target_language}.
-3.  **Conciseness**: Keep translations subtitle-friendly—clear and easy to read quickly.
-4.  **Strict JSON Output**: The output MUST be a valid JSON array of strings. Do not include any explanations, markdown, or any text outside of the JSON array.
-5.  **Name Translation**: All personal names must be translated or transliterated into {target_language}, maintaining appropriate cultural context and common naming conventions for that language.
-
-### Structural Examples (How to handle line breaks):
-
-These examples illustrate the structural rules. You will translate the content into {target_language}.
-
-**Example 1: Preserving intended line breaks.**
-*   **Input Lines**: `["when I barely sell enough milkshakes", "to justify my single spindle? Right?"]`
-*   **Analysis**: The original subtitle was intentionally split into two lines, likely for timing or readability.
-*   **Correct Output Structure**: The translation must also be a JSON array of two strings.
-    `["<translation of first line>", "<translation of second line>"]`
-*   **Incorrect Output Structure (DO NOT DO THIS)**: Merging the lines into one string.
-    `["<translation of both lines combined into one>"]`
-
-**Example 2: Keeping single-line dialogues intact.**
-*   **Input Lines**: `["- Back off. - I'm gonna."]`
-*   **Analysis**: This is a single line containing a quick exchange. It should remain a single line.
-*   **Correct Output Structure**: The translation must be a JSON array with a single string.
-    `["<translation of the full line>"]`
-*   **Incorrect Output Structure (DO NOT DO THIS)**: Splitting one line into multiple strings in the array.
-    `["<translation of '- Back off.'>", "<translation of '- I'm gonna.'>"]`
-
-### Your Task:
-Translate the following input array into {target_language}, strictly following all the rules above.
-
-**Input Lines:**
-{json.dumps(texts, ensure_ascii=False)}
-"""
-
-    async def llm(self, content: str) -> str:
+    async def call(self, content: str) -> str:
         last_exception = None
-        
+
         for attempt in range(self.max_retries):
             try:
                 response = await self.client.post(
                     self.api_endpoint,
                     headers={
                         "Content-Type": "application/json",
-                        "Authorization": f"Bearer {self.api_key}"
+                        "Authorization": f"Bearer {self.api_key}",
                     },
                     json={
                         "model": self.model,
@@ -167,377 +127,401 @@ Translate the following input array into {target_language}, strictly following a
                         "messages": [{"role": "user", "content": content}],
                     },
                 )
-                
+
                 # Handle different HTTP status codes
                 if response.status_code == 429:
-                    # Rate limit - check for Retry-After header
-                    retry_after = response.headers.get("Retry-After")
-                    if retry_after:
-                        try:
-                            wait_time = float(retry_after)
-                        except ValueError:
-                            wait_time = self.initial_delay * (2 ** attempt)
-                    else:
-                        wait_time = self.initial_delay * (2 ** attempt)
-                    
-                    logger.warning(f"Rate limit exceeded (429). Waiting {wait_time:.1f}s before retry {attempt + 1}/{self.max_retries}")
-                    await asyncio.sleep(wait_time)
-                    last_exception = RateLimitError("Rate limit exceeded", wait_time)
-                    continue
-                
+                    # Rate limit exceeded
+                    retry_after = None
+                    try:
+                        retry_after = float(response.headers.get("Retry-After"))
+                    except (TypeError, ValueError):
+                        pass
+
+                    raise RateLimitError(
+                        "Rate limit exceeded (429)",
+                        retry_after,
+                    )
+
                 elif 400 <= response.status_code < 500:
                     # Client errors (except 429) - don't retry
-                    error_msg = "Client error {}: {}".format(response.status_code, response.text)
+                    error_msg = f"Client error {response.status_code}: {response.text}"
                     logger.error(error_msg)
                     raise RuntimeError(error_msg)
-                
+
                 elif 500 <= response.status_code < 600:
                     # Server errors - retry with backoff
-                    delay_time = self.initial_delay * (2 ** attempt)
-                    logger.warning(f"Server error {response.status_code}. Retrying in {delay_time:.1f}s (attempt {attempt + 1}/{self.max_retries})")
-                    await asyncio.sleep(delay_time)
-                    last_exception = RuntimeError(f"Server error {response.status_code}")
-                    continue
-                
+                    raise ServerError(f"Server error {response.status_code}")
+
                 # Successful response
                 response.raise_for_status()
-                
-                # Parse and validate response
+
+                # Guard: empty/whitespace-only response probably means overload context
+                # Treat as empty response, let our adaptive batching handle it
+                if not response.text or response.text.strip() == "":
+                    return ""
+
+                # Parse response body as JSON
                 try:
                     result = response.json()
                 except json.JSONDecodeError as e:
-                    logger.error(f"Invalid JSON response: {response.text}")
+                    body = response.text or ""
+                    logger.error(
+                        "Invalid JSON response (status=%s, len=%s, head=%r)",
+                        response.status_code,
+                        len(body),
+                        body[:200],
+                    )
                     raise RuntimeError(f"Invalid JSON response from API: {e}")
-                
+
                 # Validate response structure
                 if not isinstance(result, dict):
                     raise RuntimeError(f"Unexpected response type: {type(result)}")
-                
+
                 if "choices" not in result:
                     raise RuntimeError(f"Missing 'choices' in API response: {result}")
-                
+
                 if not result["choices"] or len(result["choices"]) == 0:
                     raise RuntimeError(f"Empty 'choices' in API response: {result}")
-                
+
                 if "message" not in result["choices"][0]:
                     raise RuntimeError(f"Missing 'message' in API response: {result}")
-                
+
                 if "content" not in result["choices"][0]["message"]:
                     raise RuntimeError(f"Missing 'content' in API response: {result}")
-                
+
                 return result["choices"][0]["message"]["content"]
-                
+
             except httpx.TimeoutException as e:
-                delay_time = self.initial_delay * (2 ** attempt)
-                logger.warning(f"Request timeout. Retrying in {delay_time:.1f}s (attempt {attempt + 1}/{self.max_retries})")
-                await asyncio.sleep(delay_time)
+                await self._backoff(attempt, "Request timeout")
                 last_exception = e
-                
+
             except httpx.NetworkError as e:
-                delay_time = self.initial_delay * (2 ** attempt)
-                logger.warning(f"Network error: {str(e)}. Retrying in {delay_time:.1f}s (attempt {attempt + 1}/{self.max_retries})")
-                await asyncio.sleep(delay_time)
+                await self._backoff(attempt, f"Network error: {str(e)}")
                 last_exception = e
-                
-            except RuntimeError:
+
+            except RateLimitError as e:
+                await self._backoff(attempt, str(e), retry_after=e.retry_after)
+                last_exception = e
+
+            except ServerError as e:
+                await self._backoff(attempt, str(e))
+                last_exception = e
+
+            except RuntimeError as e:
                 # Don't retry RuntimeError (client errors, validation errors)
-                raise
-                
+                raise e
+
             except Exception as e:
-                delay_time = self.initial_delay * (2 ** attempt)
-                logger.error(f"Unexpected error: {str(e)}. Retrying in {delay_time:.1f}s (attempt {attempt + 1}/{self.max_retries})")
-                await asyncio.sleep(delay_time)
+                await self._backoff(attempt, f"Unexpected error: {str(e)}")
                 last_exception = e
 
-        raise RuntimeError(f"API failed after {self.max_retries} retries. Last error: {last_exception}")
-
-    @staticmethod
-    def clean_json_trailing_commas(json_str: str) -> str:
-        """Remove trailing commas from JSON string that would cause parsing errors."""
-        # Remove trailing commas before closing brackets/braces
-        # Pattern 1: , followed by optional whitespace and ]
-        json_str = re.sub(r',(\s*])', r'\1', json_str)
-        # Pattern 2: , followed by optional whitespace and }
-        json_str = re.sub(r',(\s*})', r'\1', json_str)
-        return json_str
-
-    async def translate(self, texts: List[str], target_language: str) -> List[str]:
-        for _ in range(2):
-            try:
-                prompt = self.create_prompt(texts, target_language)
-                translated_text = await self.llm(prompt)
-
-                start, end = translated_text.find("["), translated_text.rfind("]")
-                if start == -1 or end == -1:
-                    logger.debug(f"prompt: {prompt}")
-                    logger.debug(f"response: {translated_text}")
-                    raise TranslationError("No JSON array found in response")
-
-                try:
-                    json_text = translated_text[start : end + 1]
-                    # Clean trailing commas before parsing
-                    json_text = self.clean_json_trailing_commas(json_text)
-                    translated_list = json.loads(json_text)
-                except json.decoder.JSONDecodeError as e:
-                    logger.debug(f"JSON decode error: {str(e)}")
-                    logger.debug(f"Problematic JSON: {translated_text[start : end + 1]}")
-                    raise TranslationError("Not a valid JSON")
-
-                if len(translated_list) != len(texts):
-                    raise TranslationError(
-                        f"Translation count mismatch: got {len(translated_list)}, expected {len(texts)}"
-                    )
-
-                if not all(isinstance(text, str) for text in translated_list):
-                    raise TranslationError(f"Not all translations are strings: {translated_list}")
-
-                return translated_list
-
-            except TranslationError as e:
-                # might be quite often, only print in debug message
-                logger.debug(f"Error in translation: {str(e)}. Retrying...")
-
-        if len(texts) == 1:
-            raise RuntimeError("Translation failed after many tries...")
-
-        return await self.translate(texts[: len(texts) // 2], target_language) + await self.translate(
-            texts[len(texts) // 2 :], target_language
+        raise RuntimeError(
+            f"API failed after {self.max_retries} retries. Last error: {last_exception}"
         )
 
 
-class TranSRT:
-    def __init__(self, tran_api: TranAPI, max_concurrent_requests: int, filter_bad_words: bool = False):
-        self.tran_api = tran_api
-        self.semaphore = Semaphore(max_concurrent_requests)
+class SubtitleTranslator:
+    def __init__(
+        self,
+        llm_api: LLMAPI,
+        max_concurrent: int,
+        tag_mode: str = "opaque",
+        filter_bad_words: bool = False,
+    ):
+        self.llm_api = llm_api
+        self.semaphore = Semaphore(max_concurrent)
+        self.tag_mode = tag_mode if tag_mode in {"opaque", "numeric"} else "opaque"
         self.filter_bad_words = filter_bad_words
 
     @staticmethod
-    def parse_file(file_path: str, filter_bad_words: bool = False) -> List[SubtitleBlock]:
-        def normalize_spaces(text):
-            return re.sub(r'\s+', ' ', text)
-
-        def filter_bad(text):
-            bad_words = {
-                'dick': 'dic*',
-                'pussy': 'pu**y',
-                'blow job': 'blo* job',
-                'rape': 'rap*',
-                'orgasm': 'orgas*',
-                'had sex': 'haɗ seҳ',
-                'have sex': 'hav* seҳ',
-                'masturbate': 'masturbat*',
-            }
-
-            for word, censored in bad_words.items():
-                # Case-insensitive replacement
-                text = re.sub(re.escape(word), censored, text, flags=re.IGNORECASE)
-            return text
-
-        try:
-            with open(file_path, "r", encoding="utf-8") as file:
-                content = file.read()
-        except UnicodeDecodeError:
-            # Try with different encoding
-            logger.warning(f"Failed to read {file_path} with UTF-8, trying with latin-1")
-            with open(file_path, "r", encoding="latin-1") as file:
-                content = file.read()
-        except FileNotFoundError:
-            raise FileNotFoundError(f"File not found: {file_path}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to read file {file_path}: {e}")
-
-        blocks = content.strip().split("\n\n")
-        parsed_blocks = []
-        last_timestamp = -1
-        block_count = 0
-
-        for block_idx, block in enumerate(blocks):
-            lines = block.strip().split("\n")
-            if len(lines) >= 3:
-                try:
-                    # Check total number of blocks, some bad srt files have too many blocks
-                    block_count += 1
-                    if block_count > 5000:
-                        raise TooManyBlocksError(f"SRT file has too many subtitle blocks ({block_count} > 5000), might be broken or malformed")
-
-                    # Parse subtitle number
-                    try:
-                        subtitle_number = int(lines[0])
-                    except ValueError:
-                        logger.debug(f"Skipping block {block_idx}: invalid subtitle number '{lines[0]}'")
-                        continue
-
-                    # Parse timestamp
-                    if " --> " not in lines[1]:
-                        logger.debug(f"Skipping block {block_idx}: invalid timestamp format '{lines[1]}'")
-                        continue
-                    
-                    timestamp_parts = lines[1].split(" --> ")
-                    if len(timestamp_parts) != 2:
-                        logger.debug(f"Skipping block {block_idx}: malformed timestamp '{lines[1]}'")
-                        continue
-                    
-                    timestamp = timestamp_parts[0]
-                    current_timestamp = parse_timestamp(timestamp)
-                    
-                    # Skip if timestamp parsing failed
-                    if current_timestamp == -1:
-                        logger.debug(f"Skipping block {block_idx}: failed to parse timestamp")
-                        continue
-                    
-                    # Stop parsing if timestamp is out of order
-                    if current_timestamp < last_timestamp:
-                        logger.info(f"Stopping at subtitle #{lines[0]} due to out-of-order timestamp")
-                        break
-                    last_timestamp = current_timestamp
-
-                    text = " ".join(lines[2:])
-                    text = normalize_spaces(text)
-                    
-                    # Skip single character subtitles
-                    if len(text.strip()) <= 1:
-                        logger.debug(f"Skipping single character subtitle #{lines[0]}: '{text}'")
-                        continue
-                    
-                    if filter_bad_words:
-                        text = filter_bad(text)
-
-                    parsed_blocks.append(
-                        SubtitleBlock(
-                            number=subtitle_number,
-                            timestamp=lines[1],
-                            text=text
-                        )
-                    )
-                except TooManyBlocksError:
-                    raise
-                except Exception as e:
-                    logger.warning(f"Error parsing block {block_idx}: {e}. Skipping...")
-                    continue
-
-        if not parsed_blocks:
-            raise ValueError(f"No valid subtitle blocks found in {file_path}")
-
-        return parsed_blocks
+    def normalize_spaces(text: str) -> str:
+        return re.sub(r"\s+", " ", text)
 
     @staticmethod
-    def write_file(output_file: str, blocks: List[TranslationResult]):
-        with open(output_file, "w", encoding="utf-8") as file:
-            for block in blocks:
-                file.write(f"{block.number}\n")
-                file.write(f"{block.timestamp}\n")
-                file.write(f"{block.text}\n\n")
+    def filter_bad(text: str) -> str:
+        bad_words = {
+            "dick": "dic*",
+            "pussy": "pu**y",
+            "blow job": "blo* job",
+            "rape": "rap*",
+            "orgasm": "orgas*",
+            "had sex": "haɗ seҳ",
+            "have sex": "hav* seҳ",
+            "masturbate": "masturbat*",
+        }
+
+        for word, censored in bad_words.items():
+            # Case-insensitive replacement
+            text = re.sub(re.escape(word), censored, text, flags=re.IGNORECASE)
+        return text
+
+    def preprocess_subtitle(self, text: str) -> str:
+        text = self.normalize_spaces(text)
+
+        if self.filter_bad_words:
+            text = self.filter_bad(text)
+
+        return text
 
     @staticmethod
-    def post_process_translation(text: str) -> str:
-        """Applies various post-processing cleanups to the translated text."""
+    def postprocess_subtitle(text: str) -> str:
         # Split dialogues like "- Hello - World" into separate lines for readability.
         # This is a simple replacement and won't affect hyphens within words.
         return text.replace(" - ", "\n- ")
 
+    def build_prompt(self, target_language: str, tagged_inputs: list[str]) -> str:
+        if self.tag_mode == "numeric":
+            examples = (
+                '- Input: ["0000|A line broken into", "0001|two parts."]\n'
+                '  Output: ["0000|<translation of first>", "0001|<translation of second>"]\n\n'
+                '- Input: ["0000|- A single line dialogue. - With two speakers."]\n'
+                '  Output: ["0000|<translation of the whole line>"]'
+            )
+            rules_prefix = (
+                "2.  Prefix Preservation: Each input string starts with a numeric prefix like `0000|`. "
+                "Copy the SAME prefix at the start of the corresponding output string."
+            )
+        else:
+            examples = (
+                '- Input: ["aa11|A line broken into", "cc33|two parts."]\n'
+                '  Output: ["aa11|<translation of first>", "cc33|<translation of second>"]\n\n'
+                '- Input: ["aa11|- A single line dialogue. - With two speakers."]\n'
+                '  Output: ["aa11|<translation of the whole line>"]'
+            )
+            rules_prefix = (
+                "2.  Prefix Preservation: Each input string starts with an opaque token like `aa11|`. "
+                "Copy the SAME token at the start of the corresponding output string (exact characters)."
+            )
+
+        template = f"""Translate the subtitles into {{target_language}}, preserving the original line structure.
+
+### Rules:
+1.  1-to-1 Mapping: Output MUST be a JSON array with the SAME number of strings. Do not merge or split.
+{rules_prefix}
+3.  Translation Quality: Match tone and meaning. Adapt idioms. Translate names.
+4.  Strict JSON Output: Output ONLY a valid JSON array of strings.
+
+### Examples:
+{examples}
+
+### JSON Output Format:
+```json
+{{{{ "type": "array", "items": {{{{ "type": "string" }}}} }}}}
+```
+
+### Your Task:
+Translate the following input into {{target_language}}:
+```json
+{{tagged_inputs}}
+```"""
+
+        return template.format(
+            target_language=target_language,
+            tagged_inputs=json.dumps(tagged_inputs, ensure_ascii=False),
+        )
+
+    def _build_header(self, first_start: timedelta, model_name: str) -> srt.Subtitle:
+        return srt.Subtitle(
+            index=0,
+            start=timedelta(seconds=0),
+            end=min(
+                timedelta(seconds=5),
+                max(first_start - timedelta(milliseconds=1), timedelta(seconds=0)),
+            ),  # not overlapping with the first subtitle, no less than 0 seconds, no more than 5 seconds
+            content=f"Translated by SubAB (model: {model_name})",
+        )
+
+    def make_ids(self, n: int) -> list[str]:
+        # Numeric IDs
+        if self.tag_mode == "numeric":
+            return [f"{i:04d}" for i in range(n)]
+        # Opaque tokens (default): ensure uniqueness
+        ids: list[str] = []
+        seen: set[str] = set()
+        while len(ids) < n:
+            token = secrets.token_hex(2)
+            if token in seen:
+                continue
+            seen.add(token)
+            ids.append(token)
+        return ids
+
+    async def translate(self, texts: list[str], target_language: str) -> list[str]:
+        try:
+            ids = self.make_ids(len(texts))
+            tagged_inputs = [f"{id}|{text}" for id, text in zip(ids, texts)]
+
+            prompt = self.build_prompt(target_language, tagged_inputs)
+            response = await self.llm_api.call(prompt)
+
+            tagged_outputs = json_repair.loads(response)
+
+            # Check JSON schema
+            if (
+                not isinstance(tagged_outputs, list)
+                or not tagged_outputs
+                or not all(isinstance(text, str) for text in tagged_outputs)
+            ):
+                raise TranslationError(
+                    f"Not a valid array of strings: {tagged_outputs}"
+                )
+
+            outputs = [text.partition("|")[2] for text in tagged_outputs]
+
+            input_ids = {i.partition("|")[0] for i in tagged_inputs}
+            output_ids = {o.partition("|")[0] for o in tagged_outputs}
+
+            # Attempt repair when exactly one line is missing (likely merge)
+            # This is the most common case for merge errors
+            if (
+                len(tagged_inputs) == len(tagged_outputs) + 1
+                and len(input_ids - output_ids) == 1
+                and len(tagged_inputs) >= 10
+            ):
+                missing_id = list(input_ids - output_ids)[0]
+                index = ids.index(missing_id)
+                start = max(0, index - 2)
+                end = min(index + 3, len(texts))
+
+                logger.info(f"Repairing missing line at index {index}")
+
+                return (
+                    outputs[:start]
+                    + await self.translate(
+                        texts[start:end],
+                        target_language,
+                    )
+                    + outputs[end:]
+                )
+
+            # Check if the number of outputs is the same as the number of inputs
+            if len(tagged_outputs) != len(tagged_inputs):
+                raise TranslationError(
+                    f"Translation count mismatch: got {len(tagged_outputs)}, expected {len(tagged_inputs)}"
+                )
+
+            # Check if the IDs are exactly the same in order
+            for i, o in zip(tagged_inputs, tagged_outputs):
+                if i.partition("|")[0] != o.partition("|")[0]:
+                    raise TranslationError(f"ID mismatch: {i} -> {o}")
+
+            return outputs
+
+        except TranslationError as e:
+            logger.info(f"Error in translation: {str(e)}. Retrying...")
+
+        if len(texts) == 1:
+            raise RuntimeError("Translation failed after many tries...")
+
+        # Adaptive batching: split the input into two halves and translate them separately
+        # This will fix the problem of too many lines being translated at once
+        return await self.translate(
+            texts[: len(texts) // 2], target_language
+        ) + await self.translate(texts[len(texts) // 2 :], target_language)
+
     async def translate_batch(
         self,
-        batch: List[SubtitleBlock],
+        batch: list[srt.Subtitle],
         batch_num: int,
         total_batches: int,
         target_language: str,
-    ) -> List[TranslationResult]:
+    ) -> list[srt.Subtitle]:
         async with self.semaphore:
-            texts = [block.text for block in batch]
-            translated_texts = await self.tran_api.translate(texts, target_language)
+            for block in batch:
+                block.content = self.preprocess_subtitle(block.content)
 
-            results = [
-                TranslationResult(
-                    number=block.number,
-                    timestamp=block.timestamp,
-                    text=self.post_process_translation(translated_text),
-                    original_text=block.text,
-                )
-                for block, translated_text in zip(batch, translated_texts)
-            ]
+            translated_texts = await self.translate(
+                [block.content for block in batch], target_language
+            )
+
+            for block, translated_text in zip(batch, translated_texts):
+                block.content = self.postprocess_subtitle(translated_text)
 
             logger.info(f"Batch {batch_num}/{total_batches}: Completed")
-            return results
 
-    async def translate_file(self, input_file: str, output_file: str, batch_size: int, target_language: str, model_name: str, no_header: bool):
+            return batch
+
+    async def translate_file(
+        self,
+        input_file: str,
+        output_file: str,
+        batch_size: int,
+        target_language: str,
+        model_name: str,
+        no_header: bool,
+    ):
         # Parse input file
-        blocks = self.parse_file(input_file, self.filter_bad_words)
-        total_blocks = len(blocks)
+        with open(input_file, encoding="utf-8", errors="replace") as file:
+            subtitles = list(srt.parse(file.read()))
 
-        # Prepare batches
-        batches = [
-            blocks[i : i + batch_size] for i in range(0, total_blocks, batch_size)
-        ]
+        if not subtitles:
+            raise ValueError(f"Input file {input_file} is empty")
+
+        # Some malformed SRT files might have too many single character subtitle lines,
+        # we limit it to 5000 to get rid of them
+        if len(subtitles) > 5000:
+            raise ValueError(
+                f"SRT file has too many subtitle blocks ({len(subtitles)} > 5000), might be broken or malformed"
+            )
+
+        # Prepare batches (balanced): compute minimal number of groups and split evenly
+        n = len(subtitles)
+        num_groups = max(1, (n + batch_size - 1) // batch_size)  # ceil(n / batch_size)
+        base = n // num_groups
+        extra = n % num_groups
+        batches = []
+        start = 0
+        for i in range(num_groups):
+            size = base + (1 if i < extra else 0)
+            batches.append(subtitles[start : start + size])
+            start += size
 
         # Process all batches
-        translated_blocks = []
-
-        tasks = [
-            self.translate_batch(batch, i + 1, len(batches), target_language)
-            for i, batch in enumerate(batches)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Process results
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                raise RuntimeError(f"Batch {i+1} failed: {str(result)}")
-            else:
-                translated_blocks.extend(result)
-
-        # Sort results by subtitle number
-        translated_blocks.sort(key=lambda x: x.number)
-
-        # Add header block if not disabled
-        if translated_blocks and not no_header:
-            header_text = f"Translated by SubAB (model: {model_name})"
-            first_block_start_ms = parse_timestamp(
-                translated_blocks[0].timestamp.split(" --> ")[0]
-            )
-
-            header_end_ms = 5000  # Default 5 seconds
-            if 0 < first_block_start_ms < header_end_ms:
-                header_end_ms = first_block_start_ms - 1
-
-            header_timestamp = f"00:00:00,000 --> {ms_to_timestamp(header_end_ms)}"
-
-            header_block = TranslationResult(
-                number=0,  # Placeholder, will be renumbered
-                timestamp=header_timestamp,
-                text=header_text,
-                original_text="",
-            )
-
-            translated_blocks.insert(0, header_block)
-
-            # Renumber all blocks starting from 1
-            final_blocks = [
-                block._replace(number=i + 1) for i, block in enumerate(translated_blocks)
-            ]
-        else:
-            final_blocks = translated_blocks
-
-        # Write final result to file
-        self.write_file(output_file, final_blocks)
-
-        logger.info(
-            f"Translation completed: {len(final_blocks)} subtitles"
+        translated_batches = await asyncio.gather(
+            *[
+                self.translate_batch(batch, i + 1, len(batches), target_language)
+                for i, batch in enumerate(batches)
+            ],
+            return_exceptions=True,
         )
 
+        # Flatten the list of lists
+        translated_subtitles = []
+        for i, batch in enumerate(translated_batches):
+            if isinstance(batch, Exception):
+                raise RuntimeError(f"Batch {i + 1} failed: {batch}")
+            translated_subtitles.extend(batch)
 
-def parse_srt_filename(input_path: str) -> Tuple[Path, str, str]:
+        # Add header block if not disabled
+        if not no_header:
+            translated_subtitles.insert(
+                0, self._build_header(translated_subtitles[0].start, model_name)
+            )
+
+            # Renumber all blocks starting from 1
+            for i, sub in enumerate(translated_subtitles):
+                sub.index = i + 1
+
+        # Write final result to file
+        with open(output_file, "w", encoding="utf-8") as file:
+            file.write(srt.compose(translated_subtitles))
+
+        logger.info(f"Translation completed: {len(translated_subtitles)} subtitles")
+
+
+def parse_srt_filename(input_path: str) -> tuple[Path, str, str]:
     """Parse SRT filename to extract folder, name, and language."""
     path = Path(input_path)
-    
+
     if path.suffix != ".srt":
         raise ValueError(f"Not .srt file: {input_path}")
-    
+
     # Remove .srt extension
     stem = path.stem
-    
+
     # Remove .hi if present (hearing impaired)
     stem = stem.replace(".hi", "")
-    
+
     # Extract language (last part after .)
     parts = stem.rsplit(".", 1)
     if len(parts) == 2:
@@ -545,7 +529,7 @@ def parse_srt_filename(input_path: str) -> Tuple[Path, str, str]:
     else:
         name = stem
         lang = ""
-    
+
     return path.parent, name, lang
 
 
@@ -553,7 +537,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Translate SRT subtitles using an OpenAI-compatible API."
     )
-    parser.add_argument("input_path", help="Input SRT file path or folder containing SRT files")
+    parser.add_argument(
+        "input_path", help="Input SRT file path or folder containing SRT files"
+    )
     parser.add_argument(
         "--api-base",
         required=True,
@@ -588,7 +574,7 @@ def parse_args():
     parser.add_argument(
         "--max-batch-size",
         type=int,
-        default=128,
+        default=400,
         help="Maximum number of subtitles to translate in one batch",
     )
     parser.add_argument(
@@ -600,7 +586,7 @@ def parse_args():
     parser.add_argument(
         "--initial-delay",
         type=float,
-        default=1.0,
+        default=30.0,
         help="Initial delay time in seconds for retries (will be doubled each retry)",
     )
     parser.add_argument(
@@ -614,6 +600,12 @@ def parse_args():
         type=float,
         default=60.0,
         help="Timeout in seconds for API requests",
+    )
+    parser.add_argument(
+        "--tag-mode",
+        choices=["opaque", "numeric"],
+        default="opaque",
+        help="Token tagging scheme to enforce 1:1 mapping (opaque|numeric)",
     )
     parser.add_argument(
         "--force",
@@ -640,7 +632,7 @@ def parse_args():
     return parser.parse_args()
 
 
-async def process_file(input_file: str, tran_srt: TranSRT, args):
+async def process_file(input_file: str, subtitle_translator: SubtitleTranslator, args):
     try:
         folder, name, lang = parse_srt_filename(input_file)
         target_lang_code = args.target_lang_code
@@ -648,7 +640,9 @@ async def process_file(input_file: str, tran_srt: TranSRT, args):
 
         # Skip if input file is already in one of the target languages
         if lang in skip_codes:
-            logger.info(f"Input subtitle language '{lang}' is in the list of languages to skip. Skipping.")
+            logger.info(
+                f"Input subtitle language '{lang}' is in the list of languages to skip. Skipping."
+            )
             return
 
         if not args.force:
@@ -660,13 +654,14 @@ async def process_file(input_file: str, tran_srt: TranSRT, args):
                     )
                     return
 
-        try:
-            await tran_srt.translate_file(
-                input_file, str(folder / f"{name}.{target_lang_code}.srt"), args.max_batch_size, args.target_language, args.model, args.no_header
-            )
-        except TooManyBlocksError as e:
-            logger.error(f"Error processing {input_file}: {str(e)}")
-            return False
+        await subtitle_translator.translate_file(
+            input_file,
+            str(folder / f"{name}.{target_lang_code}.srt"),
+            args.max_batch_size,
+            args.target_language,
+            args.model,
+            args.no_header,
+        )
     except Exception as e:
         logger.error(f"Error processing {input_file}: {str(e)}")
         return False
@@ -682,64 +677,67 @@ async def main():
     logger = setup_logger(level=log_level)
 
     input_path = Path(args.input_path)
-    
+
     # Validate input path
     if not input_path.exists():
         logger.error(f"Input path does not exist: {input_path}")
         return 1
-    
+
     # Initialize translation API and SRT handler with context manager
-    async with TranAPI(
+    async with LLMAPI(
         api_base=args.api_base,
         api_key=args.api_key,
         model=args.model,
         max_retries=args.max_retries,
         timeout=args.timeout,
         initial_delay=args.initial_delay,
-    ) as tran_api:
-        tran_srt = TranSRT(
-            tran_api=tran_api,
-            max_concurrent_requests=args.max_concurrent,
+    ) as llm_api:
+        subtitle_translator = SubtitleTranslator(
+            llm_api=llm_api,
+            max_concurrent=args.max_concurrent,
+            tag_mode=args.tag_mode,
             filter_bad_words=args.filter_bad_words,
         )
 
         try:
+            # Process single file
             if input_path.is_file():
-                # Process single file
                 if not input_path.name.endswith(".srt"):
                     logger.error(f"Not .srt file: {input_path}")
                     return 1
-                success = await process_file(str(input_path), tran_srt, args)
+                success = await process_file(str(input_path), subtitle_translator, args)
                 return 0 if success else 1
-                
+
+            # Process all .srt files in directory
             elif input_path.is_dir():
-                # Process all .srt files in directory
                 srt_files = list(input_path.glob("**/*.srt"))
                 if not srt_files:
                     logger.error(f"No .srt files found in {input_path}")
                     return 1
-                
+
                 logger.info(f"Found {len(srt_files)} .srt files to process")
                 failed_files = []
-                
+
                 for srt_file in srt_files:
                     logger.info(f"Processing {srt_file}")
-                    success = await process_file(str(srt_file), tran_srt, args)
+                    success = await process_file(
+                        str(srt_file), subtitle_translator, args
+                    )
                     if success is False:
                         failed_files.append(srt_file)
-                
+
                 if failed_files:
                     logger.error(f"Failed to process {len(failed_files)} files:")
                     for f in failed_files:
                         logger.error(f"  - {f}")
                     return 1
-                
+
                 logger.info("All files processed successfully")
                 return 0
             else:
                 logger.error(f"Invalid input path: {input_path}")
                 return 1
-                
+
         except KeyboardInterrupt:
             logger.warning("Process interrupted by user")
             return 130  # Standard exit code for SIGINT
@@ -749,6 +747,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    import sys
     exit_code = asyncio.run(main())
     sys.exit(exit_code or 0)
