@@ -738,11 +738,12 @@ async def process_file(input_file: str, subtitle_translator: SubtitleTranslator,
         if not args.force:
             # check existing translated subtitles
             for code in skip_codes:
-                if (folder / f"{name}.{code}.srt").exists():
-                    logger.info(
-                        f"Found existing translated file '{name}.{code}.srt'. Skipping. Use --force to translate anyway."
-                    )
-                    return
+                for extra in ["", ".hi"]:
+                    if (folder / f"{name}.{code}{extra}.srt").exists():
+                        logger.info(
+                            f"Found existing translated file '{name}.{code}{extra}.srt'. Skipping. Use --force to translate anyway."
+                        )
+                        return
 
         logger.info(f"Processing {input_file}")
 
