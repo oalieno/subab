@@ -6,7 +6,6 @@ import random
 import re
 import secrets
 import sys
-from asyncio import Semaphore
 from datetime import timedelta
 from pathlib import Path
 
@@ -68,6 +67,7 @@ class LLMAPI:
         max_retries: int = 3,
         timeout: float = 60.0,
         initial_delay: float = 30.0,
+        max_concurrent: int = 5,
     ):
         self.api_endpoint = f"{api_base}/v1/chat/completions"
         self.api_key = api_key
@@ -76,6 +76,7 @@ class LLMAPI:
         self.initial_delay = initial_delay
         self.timeout = timeout
         self._client = None
+        self._semaphore = asyncio.Semaphore(max_concurrent)
 
     async def __aenter__(self):
         self._client = httpx.AsyncClient(timeout=self.timeout)
@@ -113,20 +114,25 @@ class LLMAPI:
 
         for attempt in range(self.max_retries):
             try:
-                response = await self.client.post(
-                    self.api_endpoint,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {self.api_key}",
-                    },
-                    json={
-                        "model": self.model,
-                        "stream": False,
-                        "temperature": 0.2,
-                        "top_p": 1,
-                        "messages": [{"role": "user", "content": content}],
-                    },
-                )
+                # Strictly limit concurrent API requests
+                await self._semaphore.acquire()
+                try:
+                    response = await self.client.post(
+                        self.api_endpoint,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.api_key}",
+                        },
+                        json={
+                            "model": self.model,
+                            "stream": False,
+                            "temperature": 0.2,
+                            "top_p": 1,
+                            "messages": [{"role": "user", "content": content}],
+                        },
+                    )
+                finally:
+                    self._semaphore.release()
 
                 # Handle different HTTP status codes
                 if response.status_code == 429:
@@ -224,13 +230,11 @@ class SubtitleTranslator:
     def __init__(
         self,
         llm_api: LLMAPI,
-        max_concurrent: int,
         tag_mode: str = "opaque",
         filter_bad_words: bool = False,
         karaoke_policy: str = "remove",
     ):
         self.llm_api = llm_api
-        self.semaphore = Semaphore(max_concurrent)
         self.tag_mode = tag_mode if tag_mode in {"opaque", "numeric"} else "opaque"
         self.filter_bad_words = filter_bad_words
         self.karaoke_policy = (
@@ -491,17 +495,16 @@ Translate the following input into {{target_language}}:
         total_batches: int,
         target_language: str,
     ) -> list[srt.Subtitle]:
-        async with self.semaphore:
-            translated_texts = await self.translate(
-                [sub.content for sub in batch], target_language
-            )
+        translated_texts = await self.translate(
+            [sub.content for sub in batch], target_language
+        )
 
-            for sub, translated_text in zip(batch, translated_texts):
-                sub.content = translated_text
+        for sub, translated_text in zip(batch, translated_texts):
+            sub.content = translated_text
 
-            logger.info(f"Batch {batch_num}/{total_batches}: Completed")
+        logger.info(f"Batch {batch_num}/{total_batches}: Completed")
 
-            return batch
+        return batch
 
     async def translate_file(
         self,
@@ -741,6 +744,8 @@ async def process_file(input_file: str, subtitle_translator: SubtitleTranslator,
                     )
                     return
 
+        logger.info(f"Processing {input_file}")
+
         await subtitle_translator.translate_file(
             input_file,
             str(folder / f"{name}.{target_lang_code}.srt"),
@@ -778,10 +783,10 @@ async def main():
         max_retries=args.max_retries,
         timeout=args.timeout,
         initial_delay=args.initial_delay,
+        max_concurrent=args.max_concurrent,
     ) as llm_api:
         subtitle_translator = SubtitleTranslator(
             llm_api=llm_api,
-            max_concurrent=args.max_concurrent,
             tag_mode=args.tag_mode,
             filter_bad_words=args.filter_bad_words,
             karaoke_policy=args.karaoke_policy,
@@ -807,7 +812,6 @@ async def main():
                 failed_files = []
 
                 for srt_file in srt_files:
-                    logger.info(f"Processing {srt_file}")
                     success = await process_file(
                         str(srt_file), subtitle_translator, args
                     )
