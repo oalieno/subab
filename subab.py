@@ -240,8 +240,8 @@ class SubtitleTranslator:
         )
 
     @staticmethod
-    def normalize_spaces(text: str) -> str:
-        return re.sub(r"\s+", " ", text)
+    def normalize_text(text: str) -> str:
+        return re.sub(r"\s+", "", text).strip()
 
     @staticmethod
     def filter_bad(text: str) -> str:
@@ -261,31 +261,46 @@ class SubtitleTranslator:
             text = re.sub(re.escape(word), censored, text, flags=re.IGNORECASE)
         return text
 
-    def preprocess_subtitle(self, text: str) -> str:
-        text = self.normalize_spaces(text)
+    def preprocess_subtitles(self, subtitles: list[srt.Subtitle]) -> list[srt.Subtitle]:
+        seen: set[tuple] = set()
+        result: list[srt.Subtitle] = []
 
-        if self.filter_bad_words:
-            text = self.filter_bad(text)
+        for sub in subtitles:
+            # Normalize content
+            sub.content = self.normalize_text(sub.content)
 
-        return text
+            # Skip empty subtitles
+            if sub.content == "":
+                continue
+
+            # Deduplicate exact subtitles
+            key = (sub.start, sub.end, sub.content)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            # Filter bad words
+            if self.filter_bad_words:
+                sub.content = self.filter_bad(sub.content)
+
+            result.append(sub)
+
+        return result
 
     @staticmethod
-    def postprocess_subtitle(text: str) -> str:
-        # Split dialogues like "- Hello - World" into separate lines for readability.
-        # This is a simple replacement and won't affect hyphens within words.
-        return text.replace(" - ", "\n- ")
+    def postprocess_subtitles(subtitles: list[srt.Subtitle]) -> list[srt.Subtitle]:
+        for sub in subtitles:
+            # Split dialogues like "- Hello - World" into separate lines for readability.
+            # This is a simple replacement and won't affect hyphens within words.
+            sub.content = sub.content.replace(" - ", "\n- ")
+        return subtitles
 
     @staticmethod
-    def _duration_seconds(sub: srt.Subtitle) -> float:
+    def duration_seconds(sub: srt.Subtitle) -> float:
         return max(0.0, (sub.end - sub.start).total_seconds())
 
-    @staticmethod
-    def _normalize_for_karaoke(text: str) -> str:
-        return re.sub(r"\s+", "", text).lower()
-
     def is_potential_karaoke(self, sub: srt.Subtitle) -> bool:
-        text_norm = self._normalize_for_karaoke(sub.content)
-        return len(text_norm) <= 4 or self._duration_seconds(sub) <= 0.6
+        return len(sub.content) <= 4 or self.duration_seconds(sub) <= 0.6
 
     def compute_karaoke_mask(self, subtitles: list[srt.Subtitle]) -> list[bool]:
         # Phase 1: mark potential lines by simple per-line heuristic
@@ -477,15 +492,12 @@ Translate the following input into {{target_language}}:
         target_language: str,
     ) -> list[srt.Subtitle]:
         async with self.semaphore:
-            for block in batch:
-                block.content = self.preprocess_subtitle(block.content)
-
             translated_texts = await self.translate(
-                [block.content for block in batch], target_language
+                [sub.content for sub in batch], target_language
             )
 
-            for block, translated_text in zip(batch, translated_texts):
-                block.content = self.postprocess_subtitle(translated_text)
+            for sub, translated_text in zip(batch, translated_texts):
+                sub.content = translated_text
 
             logger.info(f"Batch {batch_num}/{total_batches}: Completed")
 
@@ -504,6 +516,10 @@ Translate the following input into {{target_language}}:
         with open(input_file, encoding="utf-8", errors="replace") as file:
             subtitles = list(srt.parse(file.read()))
 
+        # preprocess subtitles
+        subtitles = self.preprocess_subtitles(subtitles)
+
+        # Check if the input file is empty
         if not subtitles:
             raise ValueError(f"Input file {input_file} is empty")
 
@@ -555,6 +571,9 @@ Translate the following input into {{target_language}}:
         for i, batch in enumerate(translated_batches):
             if isinstance(batch, Exception):
                 raise RuntimeError(f"Batch {i + 1} failed: {batch}")
+
+        # postprocess subtitles
+        subtitles = self.postprocess_subtitles(subtitles)
 
         # Add header subtitle if not disabled
         if not no_header and subtitles:
