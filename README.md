@@ -198,23 +198,24 @@ The most reliable way to use this script with Bazarr is to let the command itsel
 
 ### Setup
 
-1.  Place your `subab.py` script inside your Bazarr's `/config` directory. For example: `/path/to/your/bazarr/config/subab.py`.
+1.  Place your `subab.py` and `setup-in-bazarr.sh` inside your Bazarr's `/config` directory.
 2.  Go to your Bazarr `Settings` -> `Subtitles`.
 3.  Scroll down to the `Custom Post-Processing` section and enable it.
-4.  Paste the following one-line command into the `Command` field.
+4.  Paste the following command into the `Command` field.
 
 ### Command
 
-This command automatically creates a Python virtual environment, installs `httpx` if it's not already present, and then executes the script.
+This uses a two-step command for transparency: first run the setup script to prepare the venv/dependencies, then execute the translator script directly.
 
 ```bash
-/bin/sh -c 'VENV_PATH="/config/venv"; if [ ! -f "$VENV_PATH/bin/python" ]; then python3 -m venv "$VENV_PATH"; fi; "$VENV_PATH/bin/pip" install --no-cache-dir -q "httpx==0.28.1" "srt==3.5.3" "json-repair==0.52.0"; exec "$VENV_PATH/bin/python" /config/subab.py "{{subtitles}}" --api-base "https://your.openai.proxy/v1" --api-key "YOUR_API_KEY" --model "your-model-name" --target-language "Traditional Chinese" --target-lang-code "zh-TW" --also-skip "zh"'
+/bin/sh /config/setup-in-bazarr.sh && /config/venv/bin/python /config/subab.py "{{subtitles}}" --api-base "https://your.openai.proxy/v1" --api-key "YOUR_API_KEY" --model "your-model-name" --target-language "Traditional Chinese" --target-lang-code "zh-TW" --also-skip "zh"
 ```
 
-**Before you save, make sure to customize the following parts of the command:**
+**Before you save, make sure of the following:**
 
-- `/config/subab.py`: **Update this** to the actual path where you placed the `subab.py` script inside your Bazarr config volume.
-- `--api-key`, `--api-base`, `--model`, and language arguments: **Update these** with your actual API credentials and desired translation settings.
+- `setup-in-bazarr.sh`: Confirm it exists at `/config/setup-in-bazarr.sh` and is executable.
+- `subab.py`: Ensure it is located at `/config/subab.py` (or edit the command if you put it elsewhere).
+- `--api-key`, `--api-base`, `--model`, and language arguments: Update with your actual API credentials and desired translation settings.
 
 This setup is self-contained, persistent across Bazarr container updates, and ensures the script always has the dependencies it needs to run.
 
