@@ -227,11 +227,17 @@ class SubtitleTranslator:
         max_concurrent: int,
         tag_mode: str = "opaque",
         filter_bad_words: bool = False,
+        karaoke_policy: str = "remove",
     ):
         self.llm_api = llm_api
         self.semaphore = Semaphore(max_concurrent)
         self.tag_mode = tag_mode if tag_mode in {"opaque", "numeric"} else "opaque"
         self.filter_bad_words = filter_bad_words
+        self.karaoke_policy = (
+            karaoke_policy
+            if karaoke_policy in {"skip", "remove", "translate"}
+            else "remove"
+        )
 
     @staticmethod
     def normalize_spaces(text: str) -> str:
@@ -268,6 +274,50 @@ class SubtitleTranslator:
         # Split dialogues like "- Hello - World" into separate lines for readability.
         # This is a simple replacement and won't affect hyphens within words.
         return text.replace(" - ", "\n- ")
+
+    @staticmethod
+    def _duration_seconds(sub: srt.Subtitle) -> float:
+        return max(0.0, (sub.end - sub.start).total_seconds())
+
+    @staticmethod
+    def _normalize_for_karaoke(text: str) -> str:
+        return re.sub(r"\s+", "", text).lower()
+
+    def is_potential_karaoke(self, sub: srt.Subtitle) -> bool:
+        text_norm = self._normalize_for_karaoke(sub.content)
+        return len(text_norm) <= 4 or self._duration_seconds(sub) <= 0.6
+
+    def compute_karaoke_mask(self, subtitles: list[srt.Subtitle]) -> list[bool]:
+        # Phase 1: mark potential lines by simple per-line heuristic
+        potential = [self.is_potential_karaoke(s) for s in subtitles]
+
+        # Phase 2: confirm by local density within a time window
+        window_s = 15.0
+        count_threshold = 10
+        n = len(subtitles)
+        mask: list[bool] = [False] * n
+        starts = [s.start.total_seconds() for s in subtitles]
+        for i in range(n):
+            # skip if not potential karaoke
+            if not potential[i]:
+                continue
+
+            # expand window indices based on time distance
+            t0, l, r = starts[i], i, i
+            while l - 1 >= 0 and t0 - starts[l - 1] <= window_s:
+                l -= 1
+            while r + 1 < n and starts[r + 1] - t0 <= window_s:
+                r += 1
+
+            # count potential karaoke in the window
+            count = 0
+            for j in range(l, r + 1):
+                if potential[j]:
+                    count += 1
+            # confirm by local density
+            mask[i] = count >= count_threshold
+
+        return mask
 
     def build_prompt(self, target_language: str, tagged_inputs: list[str]) -> str:
         if self.tag_mode == "numeric":
@@ -457,26 +507,42 @@ Translate the following input into {{target_language}}:
         if not subtitles:
             raise ValueError(f"Input file {input_file} is empty")
 
-        # Some malformed SRT files might have too many single character subtitle lines,
-        # we limit it to 5000 to get rid of them
-        if len(subtitles) > 5000:
-            raise ValueError(
-                f"SRT file has too many subtitle blocks ({len(subtitles)} > 5000), might be broken or malformed"
-            )
+        # karaoke handling (pre-batch): detect and apply policy
+        if self.karaoke_policy in {"skip", "remove"}:
+            karaoke_mask = self.compute_karaoke_mask(subtitles)
+            if all(karaoke_mask):
+                raise ValueError(
+                    "SRT file appears to be all short lines, possibly broken."
+                )
+        else:
+            karaoke_mask = [False] * len(subtitles)
 
-        # Prepare batches (balanced): compute minimal number of groups and split evenly
-        n = len(subtitles)
-        num_groups = max(1, (n + batch_size - 1) // batch_size)  # ceil(n / batch_size)
-        base = n // num_groups
-        extra = n % num_groups
+        # policy: remove
+        if self.karaoke_policy == "remove":
+            subtitles = [s for i, s in enumerate(subtitles) if not karaoke_mask[i]]
+            pending_subtitles = subtitles
+        # policy: skip
+        elif self.karaoke_policy == "skip":
+            pending_subtitles = [
+                s for i, s in enumerate(subtitles) if not karaoke_mask[i]
+            ]
+        # policy: translate
+        else:
+            pending_subtitles = list(subtitles)
+
+        # Prepare batches (balanced) from pending_subtitles
         batches = []
+        n_pending = len(pending_subtitles)
+        num_groups = max(1, (n_pending + batch_size - 1) // batch_size)  # ceil
+        base = n_pending // num_groups
+        extra = n_pending % num_groups
         start = 0
         for i in range(num_groups):
             size = base + (1 if i < extra else 0)
-            batches.append(subtitles[start : start + size])
+            batches.append(pending_subtitles[start : start + size])
             start += size
 
-        # Process all batches
+        # Process all batches, replace srt in place
         translated_batches = await asyncio.gather(
             *[
                 self.translate_batch(batch, i + 1, len(batches), target_language)
@@ -485,28 +551,24 @@ Translate the following input into {{target_language}}:
             return_exceptions=True,
         )
 
-        # Flatten the list of lists
-        translated_subtitles = []
+        # Check for errors in any batch
         for i, batch in enumerate(translated_batches):
             if isinstance(batch, Exception):
                 raise RuntimeError(f"Batch {i + 1} failed: {batch}")
-            translated_subtitles.extend(batch)
 
-        # Add header block if not disabled
-        if not no_header:
-            translated_subtitles.insert(
-                0, self._build_header(translated_subtitles[0].start, model_name)
-            )
+        # Add header subtitle if not disabled
+        if not no_header and subtitles:
+            subtitles.insert(0, self._build_header(subtitles[0].start, model_name))
 
-            # Renumber all blocks starting from 1
-            for i, sub in enumerate(translated_subtitles):
-                sub.index = i + 1
+        # Renumber all subtitles starting from 1
+        for i, sub in enumerate(subtitles):
+            sub.index = i + 1
 
-        # Write final result to file
+        # Write subtitles to file
         with open(output_file, "w", encoding="utf-8") as file:
-            file.write(srt.compose(translated_subtitles))
+            file.write(srt.compose(subtitles))
 
-        logger.info(f"Translation completed: {len(translated_subtitles)} subtitles")
+        logger.info(f"Translation completed: {len(subtitles)} subtitles")
 
 
 def parse_srt_filename(input_path: str) -> tuple[Path, str, str]:
@@ -618,6 +680,12 @@ def parse_args():
         help="Filter out bad words in subtitles",
     )
     parser.add_argument(
+        "--karaoke-policy",
+        choices=["skip", "remove", "translate"],
+        default="remove",
+        help="How to handle karaoke-like short lines (skip=keep as-is, remove=drop, translate=translate)",
+    )
+    parser.add_argument(
         "--no-header",
         action="store_true",
         help="Do not add a header with translation info to the SRT file",
@@ -697,6 +765,7 @@ async def main():
             max_concurrent=args.max_concurrent,
             tag_mode=args.tag_mode,
             filter_bad_words=args.filter_bad_words,
+            karaoke_policy=args.karaoke_policy,
         )
 
         try:

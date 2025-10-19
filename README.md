@@ -4,7 +4,7 @@ SubAB is a lightweight CLI tool for translating `.srt` subtitle files using any 
 
 ## Key Features
 
-- **1:1 Mapping Enforcement**: Per-line ID tagging (opaque or numeric) guarantees strict input→output alignment, preventing merges/splits (see details below)..
+- **1:1 Mapping Enforcement**: Per-line ID tagging (opaque or numeric) guarantees strict input→output alignment, preventing merges/splits (see details below).
 - **Adaptive Batching**: Robust retry/downsize when context is too large, automatically splits batches to fit model/output limits and resolve anomalies (see details below).
 - **Bazarr Friendly**: Easily integrates with Bazarr for automated subtitle translation. (just a simple script)
 
@@ -55,10 +55,47 @@ Final Result: [ Translated C ] + [ Translated D ] + [ Translated B ]
 
 This process primarily downsizes to a reliable context window and serves as a strong retry strategy when limits or provider issues are hit.
 
+### Karaoke Handling
+
+Some providers output karaoke-style, per-syllable lines (e.g., many tiny lines during OP/ED). SubAB can automatically detect these dense short-line segments and apply a policy before batching, reducing noise and token usage. See example below:
+
+```
+30
+00:00:52,137 --> 00:00:53,388
+mi
+
+31
+00:00:52,137 --> 00:00:53,528
+no
+
+32
+00:00:52,137 --> 00:00:53,528
+no
+
+33
+00:00:52,137 --> 00:00:53,689
+sei
+
+34
+00:00:52,137 --> 00:00:53,689
+sei
+```
+
+- Policies (via `--karaoke-policy {remove,skip,translate}`):
+
+  - remove (default): drop karaoke lines; only regular lines are translated.
+  - skip: keep karaoke lines unchanged; translate regular lines only.
+  - translate: translate everything (may use more tokens).
+
+- Examples:
+  - Remove karaoke (default): `python subab.py movie.srt`
+  - Keep karaoke but don’t translate it: `python subab.py movie.srt --karaoke-policy skip`
+  - Translate everything (including karaoke): `python subab.py movie.srt --karaoke-policy translate`
+
 ## Requirements
 
 - Python 3.8 or higher
-- httpx, srt, json-repair
+- `httpx`, `srt`, `json-repair`
 
 ## Installation
 
