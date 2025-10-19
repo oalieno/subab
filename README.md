@@ -108,11 +108,13 @@ uv sync
 ### Command-Line Arguments
 
 ```
-usage: subab.py [-h] --api-key API_KEY [--api-base API_BASE] [--target-language TARGET_LANGUAGE]
-                 [--target-lang-code TARGET_LANG_CODE] [--model MODEL] [--max-batch-size MAX_BATCH_SIZE]
-                 [--max-retries MAX_RETRIES] [--initial-delay INITIAL_DELAY] [--max-concurrent MAX_CONCURRENT]
-                 [--timeout TIMEOUT] [--tag-mode {opaque,numeric}] [--force] [--filter-bad-words]
-                 [--log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}] input_path
+usage: subab.py [-h] --api-base API_BASE --api-key API_KEY [--target-language TARGET_LANGUAGE]
+                [--target-lang-code TARGET_LANG_CODE] [--also-skip [ALSO_SKIP ...]] --model MODEL
+                [--max-batch-size MAX_BATCH_SIZE] [--max-retries MAX_RETRIES]
+                [--initial-delay INITIAL_DELAY] [--max-concurrent MAX_CONCURRENT] [--timeout TIMEOUT]
+                [--tag-mode {opaque,numeric}] [--force] [--filter-bad-words]
+                [--karaoke-policy {skip,remove,translate}] [--no-header]
+                [--log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}] input_path
 
 Translate SRT subtitles using an OpenAI-compatible API.
 
@@ -121,8 +123,8 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --api-key API_KEY     API key for authentication
   --api-base API_BASE   OpenAI API proxy server base URL
+  --api-key API_KEY     API key for authentication
   --target-language TARGET_LANGUAGE
                         The target language for translation (e.g., 'English', 'Japanese', 'Traditional Chinese') (default: Traditional Chinese)
   --target-lang-code TARGET_LANG_CODE
@@ -143,6 +145,9 @@ options:
                         Token tagging scheme to enforce 1:1 mapping (default: opaque)
   --force               Force translation even if translated version exists
   --filter-bad-words    Filter out bad words in subtitles
+  --karaoke-policy {skip,remove,translate}
+                        How to handle karaoke-like short lines (skip=keep as-is, remove=drop, translate=translate) (default: remove)
+  --no-header           Do not add a header with translation info to the SRT file
   --log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}
                         Set the logging level (default: INFO)
 ```
