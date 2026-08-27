@@ -112,7 +112,9 @@ usage: subab.py [-h] --api-base API_BASE --api-key API_KEY [--target-language TA
                 [--target-lang-code TARGET_LANG_CODE] [--also-skip [ALSO_SKIP ...]] --model MODEL
                 [--max-batch-size MAX_BATCH_SIZE] [--max-retries MAX_RETRIES]
                 [--initial-delay INITIAL_DELAY] [--max-concurrent MAX_CONCURRENT] [--timeout TIMEOUT]
-                [--tag-mode {opaque,numeric}] [--force] [--filter-bad-words]
+                [--tag-mode {opaque,numeric}] [--glossary-dir GLOSSARY_DIR] [--auto-glossary]
+                [--auto-glossary-max-lines AUTO_GLOSSARY_MAX_LINES]
+                [--auto-glossary-max-entries AUTO_GLOSSARY_MAX_ENTRIES] [--force] [--filter-bad-words]
                 [--karaoke-policy {skip,remove,translate}] [--no-header]
                 [--log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}] input_path
 
@@ -143,6 +145,13 @@ options:
   --timeout TIMEOUT     Timeout in seconds for API requests (default: 60.0)
   --tag-mode {opaque,numeric}
                         Token tagging scheme to enforce 1:1 mapping (default: opaque)
+  --glossary-dir GLOSSARY_DIR
+                        Optional directory containing glossary files. Loads global.* plus files named after path components, such as the series folder name.
+  --auto-glossary       Generate a series .auto.txt glossary when no series glossary exists. Requires --glossary-dir and adds one extra API call for the first file in a series.
+  --auto-glossary-max-lines AUTO_GLOSSARY_MAX_LINES
+                        Maximum number of sampled subtitle lines used to generate an auto glossary. (default: 160)
+  --auto-glossary-max-entries AUTO_GLOSSARY_MAX_ENTRIES
+                        Maximum number of entries generated for an auto glossary. (default: 80)
   --force               Force translation even if translated version exists
   --filter-bad-words    Filter out bad words in subtitles
   --karaoke-policy {skip,remove,translate}
@@ -181,6 +190,53 @@ python subab.py "/path/to/subs" \
     --also-skip "zh"
 ```
 
+### Glossaries
+
+Use `--glossary-dir` to provide optional preferred translations without putting show-specific terms in the global prompt. SubAB loads `global.*` first, then glossary files named after path components in the input path, so a series folder can have its own terms.
+
+For example, this input:
+
+```text
+/data/media/anime/Re - ZERO, Starting Life in Another World (2016)/episode.en.srt
+```
+
+can load:
+
+```text
+/config/glossaries/global.txt
+/config/glossaries/anime.txt
+/config/glossaries/Re - ZERO, Starting Life in Another World (2016).txt
+```
+
+Supported extensions are `.json`, `.txt`, `.tsv`, `.csv`, and `.md`. Text files support these formats:
+
+```text
+Natsuki Subaru => 菜月昴
+Master Swordsman = 劍聖
+White Whale	白鯨
+```
+
+JSON files can be a simple mapping:
+
+```json
+{
+  "Natsuki Subaru": "菜月昴",
+  "Master Swordsman": "劍聖"
+}
+```
+
+or use a `terms`, `glossary`, or `entries` object/list.
+
+If `--auto-glossary` is enabled and no series glossary exists yet, SubAB makes one extra API call before translation to generate:
+
+```text
+/config/glossaries/<series folder>.auto.txt
+```
+
+The generated file is immediately used for the same translation run and reused for later episodes. It is meant to be reviewable and editable. If a hand-written series glossary is added later, it replaces the auto-generated file for that series; the `.auto.txt` can stay on disk as a draft/reference, but it will not be loaded while `<series>.txt` exists.
+
+The auto-glossary prompt includes the series/movie folder name and subtitle filename as context. It also gives paired examples of subtitle samples and the glossary that should be extracted from them, including a negative sample that should produce an empty glossary.
+
 ### Model Selection
 
 The notes below are based on tests via OpenRouter; limits and behavior can vary by provider and model. Adjust `--max-batch-size` to stay within each model’s effective output/context limits.
@@ -208,7 +264,7 @@ The most reliable way to use this script with Bazarr is to let the command itsel
 This uses a two-step command for transparency: first run the setup script to prepare the venv/dependencies, then execute the translator script directly.
 
 ```bash
-/bin/sh /config/setup-in-bazarr.sh && /config/venv/bin/python /config/subab.py "{{subtitles}}" --api-base "https://your.openai.proxy/v1" --api-key "YOUR_API_KEY" --model "your-model-name" --target-language "Traditional Chinese" --target-lang-code "zh-TW" --also-skip "zh"
+/bin/sh /config/setup-in-bazarr.sh && /config/venv/bin/python /config/subab.py "{{subtitles}}" --api-base "https://your.openai.proxy/v1" --api-key "YOUR_API_KEY" --model "your-model-name" --target-language "Traditional Chinese" --target-lang-code "zh-TW" --also-skip "zh" --glossary-dir "/config/glossaries" --auto-glossary
 ```
 
 **Before you save, make sure of the following:**

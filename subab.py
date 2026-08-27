@@ -198,31 +198,36 @@ class LLMAPI:
                 return result["choices"][0]["message"]["content"]
 
             except httpx.TimeoutException as e:
-                await self._backoff(attempt, "Request timeout")
                 last_exception = e
+                if attempt < self.max_retries - 1:
+                    await self._backoff(attempt, "Request timeout")
 
             except httpx.NetworkError as e:
-                await self._backoff(attempt, f"Network error: {str(e)}")
                 last_exception = e
+                if attempt < self.max_retries - 1:
+                    await self._backoff(attempt, f"Network error: {str(e)}")
 
             except RateLimitError as e:
-                await self._backoff(attempt, str(e), retry_after=e.retry_after)
                 last_exception = e
+                if attempt < self.max_retries - 1:
+                    await self._backoff(attempt, str(e), retry_after=e.retry_after)
 
             except ServerError as e:
-                await self._backoff(attempt, str(e))
                 last_exception = e
+                if attempt < self.max_retries - 1:
+                    await self._backoff(attempt, str(e))
 
             except RuntimeError as e:
                 # Don't retry RuntimeError (client errors, validation errors)
                 raise e
 
             except Exception as e:
-                await self._backoff(attempt, f"Unexpected error: {str(e)}")
                 last_exception = e
+                if attempt < self.max_retries - 1:
+                    await self._backoff(attempt, f"Unexpected error: {str(e)}")
 
         raise RuntimeError(
-            f"API failed after {self.max_retries} retries. Last error: {last_exception}"
+            f"API failed after {self.max_retries} attempts. Last error: {last_exception}"
         )
 
 
@@ -338,7 +343,12 @@ class SubtitleTranslator:
 
         return mask
 
-    def build_prompt(self, target_language: str, tagged_inputs: list[str]) -> str:
+    def build_prompt(
+        self,
+        target_language: str,
+        tagged_inputs: list[str],
+        glossary_entries: list[tuple[str, str]] | None = None,
+    ) -> str:
         if self.tag_mode == "numeric":
             examples = (
                 '- Input: ["0000|A line broken into", "0001|two parts."]\n'
@@ -362,6 +372,18 @@ class SubtitleTranslator:
                 "Copy the SAME token at the start of the corresponding output string (exact characters)."
             )
 
+        glossary = ""
+        if glossary_entries:
+            glossary_lines = "\n".join(
+                f'- "{source}" -> "{target}"'
+                for source, target in glossary_entries
+            )
+            glossary = f"""
+### Glossary:
+Use these preferred translations when the source term appears. Match context naturally and do not force a glossary entry when the source term clearly has a different meaning.
+{glossary_lines}
+"""
+
         template = f"""Translate the subtitles into {{target_language}}, preserving the original line structure.
 
 ### Rules:
@@ -369,6 +391,7 @@ class SubtitleTranslator:
 {rules_prefix}
 3.  Translation Quality: Match tone and meaning. Adapt idioms. Translate names.
 4.  Strict JSON Output: Output ONLY a valid JSON array of strings.
+{{glossary}}
 
 ### Examples:
 {examples}
@@ -387,6 +410,7 @@ Translate the following input into {{target_language}}:
         return template.format(
             target_language=target_language,
             tagged_inputs=json.dumps(tagged_inputs, ensure_ascii=False),
+            glossary=glossary,
         )
 
     def _build_header(self, first_start: timedelta, model_name: str) -> srt.Subtitle:
@@ -415,12 +439,17 @@ Translate the following input into {{target_language}}:
             ids.append(token)
         return ids
 
-    async def translate(self, texts: list[str], target_language: str) -> list[str]:
+    async def translate(
+        self,
+        texts: list[str],
+        target_language: str,
+        glossary_entries: list[tuple[str, str]] | None = None,
+    ) -> list[str]:
         try:
             ids = self.make_ids(len(texts))
             tagged_inputs = [f"{id}|{text}" for id, text in zip(ids, texts)]
 
-            prompt = self.build_prompt(target_language, tagged_inputs)
+            prompt = self.build_prompt(target_language, tagged_inputs, glossary_entries)
             response = await self.llm_api.call(prompt)
 
             tagged_outputs = json_repair.loads(response)
@@ -459,6 +488,7 @@ Translate the following input into {{target_language}}:
                     + await self.translate(
                         texts[start:end],
                         target_language,
+                        glossary_entries,
                     )
                     + outputs[end:]
                 )
@@ -485,8 +515,10 @@ Translate the following input into {{target_language}}:
         # Adaptive batching: split the input into two halves and translate them separately
         # This will fix the problem of too many lines being translated at once
         return await self.translate(
-            texts[: len(texts) // 2], target_language
-        ) + await self.translate(texts[len(texts) // 2 :], target_language)
+            texts[: len(texts) // 2], target_language, glossary_entries
+        ) + await self.translate(
+            texts[len(texts) // 2 :], target_language, glossary_entries
+        )
 
     async def translate_batch(
         self,
@@ -494,9 +526,10 @@ Translate the following input into {{target_language}}:
         batch_num: int,
         total_batches: int,
         target_language: str,
+        glossary_entries: list[tuple[str, str]] | None,
     ) -> list[srt.Subtitle]:
         translated_texts = await self.translate(
-            [sub.content for sub in batch], target_language
+            [sub.content for sub in batch], target_language, glossary_entries
         )
 
         for sub, translated_text in zip(batch, translated_texts):
@@ -514,10 +547,14 @@ Translate the following input into {{target_language}}:
         target_language: str,
         model_name: str,
         no_header: bool,
+        glossary_entries: list[tuple[str, str]] | None = None,
+        parsed_subtitles: list[srt.Subtitle] | None = None,
     ):
-        # Parse input file
-        with open(input_file, encoding="utf-8", errors="replace") as file:
-            subtitles = list(srt.parse(file.read()))
+        if parsed_subtitles is None:
+            with open(input_file, encoding="utf-8", errors="replace") as file:
+                subtitles = list(srt.parse(file.read()))
+        else:
+            subtitles = parsed_subtitles
 
         # preprocess subtitles
         subtitles = self.preprocess_subtitles(subtitles)
@@ -564,7 +601,9 @@ Translate the following input into {{target_language}}:
         # Process all batches, replace srt in place
         translated_batches = await asyncio.gather(
             *[
-                self.translate_batch(batch, i + 1, len(batches), target_language)
+                self.translate_batch(
+                    batch, i + 1, len(batches), target_language, glossary_entries
+                )
                 for i, batch in enumerate(batches)
             ],
             return_exceptions=True,
@@ -615,6 +654,435 @@ def parse_srt_filename(input_path: str) -> tuple[Path, str, str]:
         lang = ""
 
     return path.parent, name, lang
+
+
+GLOSSARY_EXTENSIONS = (".json", ".txt", ".tsv", ".csv", ".md")
+MAX_GLOSSARY_ENTRIES = 400
+MAX_AUTO_GLOSSARY_ENTRIES = 80
+
+
+def dedupe_glossary_entries(
+    entries: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    deduped: dict[str, str] = {}
+    order: list[str] = []
+
+    for source, target in entries:
+        source = source.strip()
+        target = target.strip()
+        if not source or not target:
+            continue
+        if source not in deduped:
+            order.append(source)
+        # Later files override earlier files, so series-specific entries can
+        # override global entries.
+        deduped[source] = target
+
+    return [(source, deduped[source]) for source in order][:MAX_GLOSSARY_ENTRIES]
+
+
+def entries_from_mapping(mapping: dict) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for source, target in mapping.items():
+        if isinstance(target, str):
+            entries.append((str(source), target))
+    return entries
+
+
+def parse_json_glossary(path: Path) -> list[tuple[str, str]]:
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+
+    if isinstance(data, dict):
+        for key in ("terms", "glossary", "entries"):
+            if key in data:
+                data = data[key]
+                break
+
+    if isinstance(data, dict):
+        return entries_from_mapping(data)
+
+    if isinstance(data, list):
+        entries: list[tuple[str, str]] = []
+        for item in data:
+            if isinstance(item, dict):
+                source = item.get("source") or item.get("from") or item.get("term")
+                target = item.get("target") or item.get("to") or item.get("translation")
+                if isinstance(source, str) and isinstance(target, str):
+                    entries.append((source, target))
+            elif (
+                isinstance(item, list)
+                and len(item) >= 2
+                and isinstance(item[0], str)
+                and isinstance(item[1], str)
+            ):
+                entries.append((item[0], item[1]))
+        return entries
+
+    return []
+
+
+def parse_text_glossary(path: Path) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        source = target = ""
+        for separator in ("\t", "=>", "->", "=", ":"):
+            if separator in line:
+                source, target = line.split(separator, 1)
+                break
+
+        if source and target:
+            entries.append((source.strip(), target.strip()))
+
+    return entries
+
+
+def parse_glossary_file(path: Path) -> list[tuple[str, str]]:
+    if path.suffix == ".json":
+        return parse_json_glossary(path)
+    return parse_text_glossary(path)
+
+
+def matching_glossary_files(input_file: str, glossary_dir: str | None) -> list[Path]:
+    if not glossary_dir:
+        return []
+
+    root = Path(glossary_dir)
+    if not root.is_dir():
+        logger.warning(f"Glossary directory does not exist: {root}")
+        return []
+
+    input_path = Path(input_file)
+    stems: list[str] = ["global"]
+    for parent in reversed(input_path.parent.parents):
+        stems.append(parent.name)
+    stems.append(input_path.parent.name)
+
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for stem in stems:
+        if not stem:
+            continue
+        manual_paths: list[Path] = []
+        auto_paths: list[Path] = []
+        for extension in GLOSSARY_EXTENSIONS:
+            manual_path = root / f"{stem}{extension}"
+            auto_path = root / f"{stem}.auto{extension}"
+            if manual_path.is_file():
+                manual_paths.append(manual_path)
+            if auto_path.is_file():
+                auto_paths.append(auto_path)
+
+        # A hand-written glossary for the same stem replaces its auto-generated
+        # draft entirely. This keeps one-off auto terms from leaking forward.
+        for path in manual_paths or auto_paths:
+            if path not in seen:
+                files.append(path)
+                seen.add(path)
+
+    return files
+
+
+def series_glossary_files(input_file: str, glossary_dir: str | None) -> list[Path]:
+    if not glossary_dir:
+        return []
+
+    root = Path(glossary_dir)
+    if not root.is_dir():
+        return []
+
+    series_name = Path(input_file).parent.name
+    files: list[Path] = []
+    for extension in GLOSSARY_EXTENSIONS:
+        for suffix in ("", ".auto"):
+            path = root / f"{series_name}{suffix}{extension}"
+            if path.is_file():
+                files.append(path)
+    return files
+
+
+def load_glossary_entries(
+    input_file: str, glossary_dir: str | None
+) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    files = matching_glossary_files(input_file, glossary_dir)
+
+    for path in files:
+        try:
+            entries.extend(parse_glossary_file(path))
+        except Exception as e:
+            logger.warning(f"Failed to parse glossary file {path}: {e}")
+
+    entries = dedupe_glossary_entries(entries)
+    if entries:
+        logger.info(
+            "Loaded %s glossary entries from %s",
+            len(entries),
+            ", ".join(str(path) for path in files),
+        )
+    return entries
+
+
+def sample_subtitle_texts(
+    subtitles: list[srt.Subtitle], max_lines: int
+) -> list[str]:
+    if max_lines <= 0 or len(subtitles) <= max_lines:
+        return [sub.content for sub in subtitles]
+
+    # Keep coverage across the whole episode/movie instead of only sampling the
+    # beginning, where OP/signs can dominate.
+    indexes = sorted(
+        {
+            round(i * (len(subtitles) - 1) / (max_lines - 1))
+            for i in range(max_lines)
+        }
+    )
+    return [subtitles[i].content for i in indexes]
+
+
+def build_auto_glossary_prompt(
+    target_language: str,
+    texts: list[str],
+    max_entries: int,
+    *,
+    series_title: str,
+    media_title: str,
+) -> str:
+    return f"""Extract a translation glossary for subtitle translation into {target_language}.
+
+Return ONLY a valid JSON object mapping source terms to preferred {target_language} translations.
+
+Media context:
+- Series/movie folder: {series_title}
+- Subtitle/media file: {media_title}
+
+Rules:
+1. Include only named entities and series-specific terms: character names, family names, organizations, places, spells, formal titles, artifacts, races, and recurring fictional concepts.
+2. Do not include common dictionary words, ordinary verbs/adjectives, generic phrases, speaker labels, or full sentences.
+3. Prefer established/natural {target_language} translations when obvious.
+4. Keep source terms exactly as they appear in the subtitles.
+5. Limit to at most {max_entries} entries.
+6. Exclude complete dialogue lines, commands, greetings, interjections, and one-off descriptions.
+7. The examples below show how to extract terms from subtitle samples. Never copy an example term unless it appears in the media context or subtitle sample.
+
+Extraction examples:
+```json
+[
+  {{
+    "subtitle_sample": [
+      "My name is Natsuki Subaru!",
+      "Crusch-sama, the White Whale is approaching.",
+      "Rem and Ram are waiting in Lugunica.",
+      "Thank you.",
+      "Run!"
+    ],
+    "expected_glossary": {{
+      "Natsuki Subaru": "菜月昴",
+      "Crusch-sama": "庫珥修大人",
+      "White Whale": "白鯨",
+      "Rem": "雷姆",
+      "Ram": "拉姆",
+      "Lugunica": "露格尼卡"
+    }}
+  }},
+  {{
+    "subtitle_sample": [
+      "Voice",
+      "Girl",
+      "Knight A",
+      "I know.",
+      "Things are getting better.",
+      "What happened?",
+      "Get in trouble.",
+      "Close your eyes."
+    ],
+    "expected_glossary": {{}}
+  }}
+]
+```
+
+Subtitles:
+```json
+{json.dumps(texts, ensure_ascii=False)}
+```"""
+
+
+def looks_like_dialogue_line(source: str) -> bool:
+    source = source.strip()
+    if not source:
+        return True
+    if re.search(r"[.!?…。！？]$", source):
+        return True
+    if "..." in source or "…" in source:
+        return True
+
+    words = source.split()
+    if len(words) > 5:
+        return True
+
+    lower = source.lower()
+    if re.search(r"\b(i|you|we|they|he|she|it|my|your|our|me|us)\b", lower):
+        return True
+
+    return False
+
+
+def looks_like_named_or_fictional_term(source: str) -> bool:
+    source = source.strip()
+    if not source:
+        return False
+
+    if re.search(r"[-']", source):
+        return True
+    if re.search(r"\b[A-Z]{2,}\b", source):
+        return True
+    if re.search(r"\b[A-Z][a-z]+(?:\s+(?:of|the|van|von|de|da|du|[A-Z][a-z]+))*\b", source):
+        return True
+
+    return False
+
+
+def filter_auto_glossary_entries(
+    entries: list[tuple[str, str]],
+    max_entries: int,
+    *,
+    source_context: str | None = None,
+) -> list[tuple[str, str]]:
+    filtered: list[tuple[str, str]] = []
+    normalized_context = source_context.lower() if source_context else ""
+    generic_speaker_labels = {
+        "boy",
+        "girl",
+        "man",
+        "woman",
+        "old man",
+        "young man",
+        "young woman",
+        "child",
+        "children",
+        "merchant",
+        "vendor",
+        "guard",
+        "soldier",
+        "knight",
+        "voice",
+    }
+
+    for source, target in dedupe_glossary_entries(entries):
+        if looks_like_dialogue_line(source):
+            continue
+        if not looks_like_named_or_fictional_term(source):
+            continue
+        if normalized_context and source.lower() not in normalized_context:
+            continue
+        if source.strip().lower() in generic_speaker_labels:
+            continue
+        if re.fullmatch(r"[A-Z][a-z]+ [A-Z]", source.strip()):
+            continue
+        filtered.append((source, target))
+        if len(filtered) >= max_entries:
+            break
+    return filtered
+
+
+def write_text_glossary(
+    path: Path,
+    entries: list[tuple[str, str]],
+    *,
+    input_file: str,
+    model_name: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"# Auto-generated by SubAB (model: {model_name})",
+        f"# Source: {input_file}",
+        "# Review recommended.",
+        "",
+    ]
+    lines.extend(f"{source} => {target}" for source, target in entries)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+async def generate_auto_glossary(
+    input_file: str,
+    subtitles: list[srt.Subtitle],
+    llm_api: LLMAPI,
+    target_language: str,
+    model_name: str,
+    glossary_dir: str,
+    max_lines: int,
+    max_entries: int,
+) -> list[tuple[str, str]]:
+    root = Path(glossary_dir)
+    series_name = Path(input_file).parent.name
+    output_path = root / f"{series_name}.auto.txt"
+
+    texts = sample_subtitle_texts(subtitles, max_lines)
+    if not texts:
+        return []
+
+    input_path = Path(input_file)
+    prompt = build_auto_glossary_prompt(
+        target_language,
+        texts,
+        max_entries,
+        series_title=input_path.parent.name,
+        media_title=input_path.name,
+    )
+    response = await llm_api.call(prompt)
+    data = json_repair.loads(response)
+
+    if isinstance(data, dict):
+        entries = entries_from_mapping(data)
+    elif isinstance(data, list):
+        entries = []
+        for item in data:
+            if isinstance(item, dict):
+                source = item.get("source") or item.get("from") or item.get("term")
+                target = item.get("target") or item.get("to") or item.get("translation")
+                if isinstance(source, str) and isinstance(target, str):
+                    entries.append((source, target))
+            elif (
+                isinstance(item, list)
+                and len(item) >= 2
+                and isinstance(item[0], str)
+                and isinstance(item[1], str)
+            ):
+                entries.append((item[0], item[1]))
+    else:
+        raise RuntimeError(f"Unexpected auto glossary response: {data}")
+
+    source_context = "\n".join(
+        [
+            input_path.parent.name,
+            input_path.name,
+            *(sub.content for sub in subtitles),
+        ]
+    )
+    entries = filter_auto_glossary_entries(
+        entries,
+        max_entries,
+        source_context=source_context,
+    )
+    if entries:
+        write_text_glossary(
+            output_path,
+            entries,
+            input_file=input_file,
+            model_name=model_name,
+        )
+        logger.info(
+            "Generated auto glossary with %s entries: %s",
+            len(entries),
+            output_path,
+        )
+    else:
+        logger.info("Auto glossary generation returned no entries")
+
+    return entries
 
 
 def parse_args():
@@ -692,6 +1160,34 @@ def parse_args():
         help="Token tagging scheme to enforce 1:1 mapping (opaque|numeric)",
     )
     parser.add_argument(
+        "--glossary-dir",
+        default=None,
+        help=(
+            "Optional directory containing glossary files. Loads global.* plus "
+            "files named after path components, such as the series folder name."
+        ),
+    )
+    parser.add_argument(
+        "--auto-glossary",
+        action="store_true",
+        help=(
+            "Generate a series .auto.txt glossary when no series glossary exists. "
+            "Requires --glossary-dir and adds one extra API call for the first file in a series."
+        ),
+    )
+    parser.add_argument(
+        "--auto-glossary-max-lines",
+        type=int,
+        default=160,
+        help="Maximum number of sampled subtitle lines used to generate an auto glossary.",
+    )
+    parser.add_argument(
+        "--auto-glossary-max-entries",
+        type=int,
+        default=MAX_AUTO_GLOSSARY_ENTRIES,
+        help="Maximum number of entries generated for an auto glossary.",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Force translation even if Chinese version exists",
@@ -746,6 +1242,37 @@ async def process_file(input_file: str, subtitle_translator: SubtitleTranslator,
                         return
 
         logger.info(f"Processing {input_file}")
+        glossary_entries = load_glossary_entries(input_file, args.glossary_dir)
+
+        with open(input_file, encoding="utf-8", errors="replace") as file:
+            parsed_subtitles = list(srt.parse(file.read()))
+
+        if (
+            args.auto_glossary
+            and args.glossary_dir
+            and not series_glossary_files(input_file, args.glossary_dir)
+        ):
+            try:
+                auto_entries = await generate_auto_glossary(
+                    input_file=input_file,
+                    subtitles=parsed_subtitles,
+                    llm_api=subtitle_translator.llm_api,
+                    target_language=args.target_language,
+                    model_name=args.model,
+                    glossary_dir=args.glossary_dir,
+                    max_lines=args.auto_glossary_max_lines,
+                    max_entries=args.auto_glossary_max_entries,
+                )
+                glossary_entries = dedupe_glossary_entries(
+                    glossary_entries + auto_entries
+                )
+            except Exception as e:
+                logger.warning(
+                    "Auto glossary generation failed; continuing without a generated glossary: %s",
+                    e,
+                )
+        elif args.auto_glossary and not args.glossary_dir:
+            logger.warning("--auto-glossary ignored because --glossary-dir is not set")
 
         await subtitle_translator.translate_file(
             input_file,
@@ -754,6 +1281,8 @@ async def process_file(input_file: str, subtitle_translator: SubtitleTranslator,
             args.target_language,
             args.model,
             args.no_header,
+            glossary_entries,
+            parsed_subtitles,
         )
     except Exception as e:
         logger.error(f"Error processing {input_file}: {str(e)}")
