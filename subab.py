@@ -68,6 +68,8 @@ class LLMAPI:
         timeout: float = 60.0,
         initial_delay: float = 30.0,
         max_concurrent: int = 5,
+        provider_order: list[str] | None = None,
+        no_reasoning: bool = False,
     ):
         self.api_endpoint = f"{api_base}/v1/chat/completions"
         self.api_key = api_key
@@ -75,6 +77,8 @@ class LLMAPI:
         self.max_retries = max_retries
         self.initial_delay = initial_delay
         self.timeout = timeout
+        self.provider_order = provider_order
+        self.no_reasoning = no_reasoning
         self._client = None
         self._semaphore = asyncio.Semaphore(max_concurrent)
 
@@ -114,22 +118,43 @@ class LLMAPI:
 
         for attempt in range(self.max_retries):
             try:
+                payload = {
+                    "model": self.model,
+                    "stream": False,
+                    "temperature": 0.2,
+                    "top_p": 1,
+                    "messages": [{"role": "user", "content": content}],
+                }
+                if self.provider_order:
+                    # OpenRouter provider routing: pin to specific providers
+                    # and never fall back to a random one.
+                    payload["provider"] = {
+                        "order": self.provider_order,
+                        "allow_fallbacks": False,
+                    }
+                if self.no_reasoning:
+                    # Hybrid reasoning models (e.g. deepseek-v4) think by
+                    # default, which is 5-10x slower and unnecessary for
+                    # subtitle translation.
+                    payload["reasoning"] = {"enabled": False}
+
                 # Strictly limit concurrent API requests
                 await self._semaphore.acquire()
                 try:
-                    response = await self.client.post(
-                        self.api_endpoint,
-                        headers={
-                            "Content-Type": "application/json",
-                            "Authorization": f"Bearer {self.api_key}",
-                        },
-                        json={
-                            "model": self.model,
-                            "stream": False,
-                            "temperature": 0.2,
-                            "top_p": 1,
-                            "messages": [{"role": "user", "content": content}],
-                        },
+                    # Hard deadline on the whole request. OpenRouter keeps
+                    # non-streaming connections alive with periodic whitespace,
+                    # which resets httpx's read timeout, so a stuck provider
+                    # can hang forever without this.
+                    response = await asyncio.wait_for(
+                        self.client.post(
+                            self.api_endpoint,
+                            headers={
+                                "Content-Type": "application/json",
+                                "Authorization": f"Bearer {self.api_key}",
+                            },
+                            json=payload,
+                        ),
+                        timeout=self.timeout * 3,
                     )
                 finally:
                     self._semaphore.release()
@@ -197,7 +222,7 @@ class LLMAPI:
 
                 return result["choices"][0]["message"]["content"]
 
-            except httpx.TimeoutException as e:
+            except (httpx.TimeoutException, asyncio.TimeoutError) as e:
                 last_exception = e
                 if attempt < self.max_retries - 1:
                     await self._backoff(attempt, "Request timeout")
@@ -1124,6 +1149,24 @@ def parse_args():
         help="LLM model",
     )
     parser.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "Comma-separated OpenRouter provider slugs to pin, in order of "
+            "preference (e.g. 'relace/fp4,novita/fp8'). Disables fallback to "
+            "other providers."
+        ),
+    )
+    parser.add_argument(
+        "--no-reasoning",
+        action="store_true",
+        help=(
+            "Disable thinking/reasoning on hybrid reasoning models "
+            "(OpenRouter 'reasoning: {enabled: false}'). Much faster for "
+            "translation."
+        ),
+    )
+    parser.add_argument(
         "--max-batch-size",
         type=int,
         default=400,
@@ -1314,6 +1357,12 @@ async def main():
         timeout=args.timeout,
         initial_delay=args.initial_delay,
         max_concurrent=args.max_concurrent,
+        provider_order=(
+            [p.strip() for p in args.provider.split(",") if p.strip()]
+            if args.provider
+            else None
+        ),
+        no_reasoning=args.no_reasoning,
     ) as llm_api:
         subtitle_translator = SubtitleTranslator(
             llm_api=llm_api,

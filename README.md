@@ -110,6 +110,7 @@ uv sync
 ```
 usage: subab.py [-h] --api-base API_BASE --api-key API_KEY [--target-language TARGET_LANGUAGE]
                 [--target-lang-code TARGET_LANG_CODE] [--also-skip [ALSO_SKIP ...]] --model MODEL
+                [--provider PROVIDER] [--no-reasoning]
                 [--max-batch-size MAX_BATCH_SIZE] [--max-retries MAX_RETRIES]
                 [--initial-delay INITIAL_DELAY] [--max-concurrent MAX_CONCURRENT] [--timeout TIMEOUT]
                 [--tag-mode {opaque,numeric}] [--glossary-dir GLOSSARY_DIR] [--auto-glossary]
@@ -134,6 +135,8 @@ options:
   --also-skip ALSO_SKIP [ALSO_SKIP ...]
                         Also skip translating if files with these language codes exist (e.g., for target 'zh-TW', you might want to skip if 'zh' exists). (default: None)
   --model MODEL         LLM model
+  --provider PROVIDER   Comma-separated OpenRouter provider slugs to pin, in order of preference (e.g. 'relace/fp4,novita/fp8'). Disables fallback to other providers.
+  --no-reasoning        Disable thinking/reasoning on hybrid reasoning models (OpenRouter 'reasoning: {enabled: false}'). Much faster for translation.
   --max-batch-size MAX_BATCH_SIZE
                         Maximum number of subtitles to translate in one batch (default: 400)
   --max-retries MAX_RETRIES
