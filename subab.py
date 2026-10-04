@@ -657,6 +657,11 @@ Translate the following input into {{target_language}}:
         logger.info(f"Translation completed: {len(subtitles)} subtitles")
 
 
+VIDEO_EXTENSIONS = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".webm", ".mov", ".wmv")
+SUBTITLE_FLAGS = {"hi", "sdh", "cc", "forced"}
+LANG_CODE_RE = re.compile(r"^[A-Za-z]{2,3}([-_][A-Za-z0-9]{2,4})?$")
+
+
 def parse_srt_filename(input_path: str) -> tuple[Path, str, str]:
     """Parse SRT filename to extract folder, name, and language."""
     path = Path(input_path)
@@ -667,18 +672,34 @@ def parse_srt_filename(input_path: str) -> tuple[Path, str, str]:
     # Remove .srt extension
     stem = path.stem
 
-    # Remove .hi if present (hearing impaired)
-    stem = stem.replace(".hi", "")
+    # Release names contain dots (e.g. "[AAC 2.0]"), so prefer the video file
+    # next to the subtitle to tell where the name ends and the tags begin.
+    try:
+        video_stems = [
+            p.stem
+            for p in path.parent.iterdir()
+            if p.suffix.lower() in VIDEO_EXTENSIONS
+        ]
+    except OSError:
+        video_stems = []
+    matches = [v for v in video_stems if stem == v or stem.startswith(v + ".")]
+    if matches:
+        name = max(matches, key=len)
+        tags = [
+            t
+            for t in stem[len(name) :].split(".")
+            if t and t.lower() not in SUBTITLE_FLAGS
+        ]
+        return path.parent, name, tags[-1] if tags else ""
 
-    # Extract language (last part after .)
-    parts = stem.rsplit(".", 1)
-    if len(parts) == 2:
-        name, lang = parts
-    else:
-        name = stem
-        lang = ""
-
-    return path.parent, name, lang
+    # No matching video: drop trailing flags (.hi, .forced, ...) and treat the
+    # last part as the language only if it looks like a language code.
+    parts = stem.split(".")
+    while len(parts) > 1 and parts[-1].lower() in SUBTITLE_FLAGS:
+        parts.pop()
+    if len(parts) > 1 and LANG_CODE_RE.match(parts[-1]):
+        return path.parent, ".".join(parts[:-1]), parts[-1]
+    return path.parent, ".".join(parts), ""
 
 
 GLOSSARY_EXTENSIONS = (".json", ".txt", ".tsv", ".csv", ".md")
