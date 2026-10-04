@@ -3,7 +3,8 @@
 # This script is intended to be used in Bazarr's Custom Post-Processing section.
 # Prepare a persistent venv in /config/venv and ensure required deps.
 # Does NOT execute subab.py; intended to be run as:
-#   /config/setup-in-bazarr.sh && /config/subab.py "...args..."
+#   /bin/sh -c '/bin/sh /config/setup-in-bazarr.sh && exec /config/venv/bin/python /config/subab.py "$0" ...args...' "{{subtitles}}"
+# Bazarr runs the command without a shell, so the "&&" needs the explicit sh -c.
 
 set -eu
 

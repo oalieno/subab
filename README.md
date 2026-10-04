@@ -266,8 +266,10 @@ The most reliable way to use this script with Bazarr is to let the command itsel
 
 This uses a two-step command for transparency: first run the setup script to prepare the venv/dependencies, then execute the translator script directly.
 
+Bazarr runs the command without a shell, so `&&` only works inside an explicit `/bin/sh -c '...'`. The subtitle path is passed as a separate argument (`"{{subtitles}}"` at the very end) and read as `"$0"` inside the quoted script, because Bazarr only substitutes `{{subtitles}}` when it is an argument of its own.
+
 ```bash
-/bin/sh /config/setup-in-bazarr.sh && /config/venv/bin/python /config/subab.py "{{subtitles}}" --api-base "https://your.openai.proxy/v1" --api-key "YOUR_API_KEY" --model "your-model-name" --target-language "Traditional Chinese" --target-lang-code "zh-TW" --also-skip "zh" --glossary-dir "/config/glossaries" --auto-glossary
+/bin/sh -c '/bin/sh /config/setup-in-bazarr.sh && exec /config/venv/bin/python /config/subab.py "$0" --api-base "https://your.openai.proxy/v1" --api-key "YOUR_API_KEY" --model "your-model-name" --target-language "Traditional Chinese" --target-lang-code "zh-TW" --also-skip "zh" --glossary-dir "/config/glossaries" --auto-glossary 2>&1' "{{subtitles}}"
 ```
 
 **Before you save, make sure of the following:**
@@ -275,6 +277,7 @@ This uses a two-step command for transparency: first run the setup script to pre
 - `setup-in-bazarr.sh`: Confirm it exists at `/config/setup-in-bazarr.sh` and is executable.
 - `subab.py`: Ensure it is located at `/config/subab.py` (or edit the command if you put it elsewhere).
 - `--api-key`, `--api-base`, `--model`, and language arguments: Update with your actual API credentials and desired translation settings.
+- `2>&1`: Keeps the script's log in Bazarr's log as the post-processing result. Without it Bazarr reports every run as an error, because the script logs to stderr.
 
 This setup is self-contained, persistent across Bazarr container updates, and ensures the script always has the dependencies it needs to run.
 
